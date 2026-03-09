@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vlm.md - 下一代AI大模型生态域名</title>
+    <meta name="description" content="vlm.md - 稀缺的两字母.md域名，深度绑定OpenClaw AI生态，极具投资价值">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --accent: #ec4899;
+            --bg: #0f172a;
+            --bg-light: #1e293b;
+            --text: #f1f5f9;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --border: #334155;
+            --gradient: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 50%, var(--accent) 100%);
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* 背景动画 */
+        .bg-animation {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            opacity: 0.1;
+            background: radial-gradient(circle at 20% 80%, rgba(99, 102, 241, 0.8) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 20%, rgba(139, 92, 246, 0.8) 0%, transparent 50%),
+                        radial-gradient(circle at 40% 40%, rgba(236, 72, 153, 0.6) 0%, transparent 50%);
+            animation: pulse 8s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.1; }
+            50% { transform: scale(1.2); opacity: 0.15; }
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            position: relative;
+            z-index: 1;
+        }
+
+        header {
+            padding: 2rem 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 2rem;
+            font-weight: 700;
+            background: var(--gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s ease;
+        }
+
+        .nav-links a:hover {
+            color: var(--primary);
+        }
+
+        .hero {
+            min-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 4rem 0;
+        }
+
+        .hero h1 {
+            font-size: clamp(3rem, 8vw, 6rem);
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            line-height: 1.1;
+            background: var(--gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: float 3s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 3rem;
+        }
+
+        .highlight {
+            color: var(--primary);
+            font-weight: 600;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .btn {
+            padding: 1rem 2rem;
+            border-radius: 0.75rem;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            border: none;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+
+        .btn-primary {
+            background: var(--gradient);
+            color: white;
+            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 30px -5px rgba(99, 102, 241, 0.6);
+        }
+
+        .btn-secondary {
+            background: var(--bg-light);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: var(--border);
+            border-color: var(--primary);
+        }
+
+        .features {
+            padding: 4rem 0;
+        }
+
+        .section-title {
+            text-align: center;
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 3rem;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+
+        .feature-card {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 2rem;
+            transition: all 0.3s ease;
+        }
+
+        .feature-card:hover {
+            border-color: var(--primary);
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.2);
+        }
+
+        .feature-icon {
+            width: 3rem;
+            height: 3rem;
+            background: var(--gradient);
+            border-radius: 0.75rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .feature-card h3 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .feature-card p {
+            color: var(--text-secondary);
+            line-height: 1.7;
+        }
+
+        .value-section {
+            padding: 4rem 0;
+            background: var(--bg-light);
+            border-radius: 2rem;
+            margin: 4rem 0;
+        }
+
+        .value-content {
+            max-width: 800px;
+            margin: 0 auto;
+            text-align: center;
+        }
+
+        .value-content h2 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+        }
+
+        .value-content p {
+            color: var(--text-secondary);
+            font-size: 1.125rem;
+            margin-bottom: 2rem;
+            line-height: 1.8;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 2rem;
+            margin-top: 3rem;
+        }
+
+        .stat-card h3 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: var(--gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-card p {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .contact-section {
+            padding: 4rem 0;
+            text-align: center;
+        }
+
+        .contact-section h2 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+        }
+
+        .contact-section p {
+            color: var(--text-secondary);
+            margin-bottom: 2rem;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .contact-methods {
+            display: flex;
+            gap: 2rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 2rem;
+        }
+
+        .contact-method {
+            background: var(--bg-light);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.5rem 2rem;
+            min-width: 200px;
+            transition: all 0.3s ease;
+        }
+
+        .contact-method:hover {
+            border-color: var(--primary);
+            transform: translateY(-3px);
+        }
+
+        .contact-method h4 {
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .contact-method a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .contact-method a:hover {
+            text-decoration: underline;
+        }
+
+        footer {
+            padding: 3rem 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-muted);
+            margin-top: 4rem;
+        }
+
+        @media (max-width: 768px) {
+            .nav-links {
+                display: none;
+            }
+
+            .hero h1 {
+                font-size: 3rem;
+            }
+
+            .hero p {
+                font-size: 1rem;
+            }
+
+            .cta-buttons {
+                flex-direction: column;
+                width: 100%;
+            }
+
+            .btn {
+                width: 100%;
+            }
+
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-animation"></div>
+    
+    <div class="container">
+        <header>
+            <div class="logo">vlm.md</div>
+            <nav>
+                <ul class="nav-links">
+                    <li><a href="#about">关于域名</a></li>
+                    <li><a href="#value">投资价值</a></li>
+                    <li><a href="#contact">联系我们</a></li>
+                </ul>
+            </nav>
+        </header>
+
+        <section class="hero">
+            <h1>vlm.md</h1>
+            <p>稀缺的两字母 <span class="highlight">.md</span> 域名，深度绑定 <span class="highlight">OpenClaw AI</span> 生态，抢占下一代大模型赛道入口</p>
+            <div class="cta-buttons">
+                <a href="#contact" class="btn btn-primary">立即询价</a>
+                <a href="#value" class="btn btn-secondary">了解投资价值</a>
+            </div>
+        </section>
+
+        <section id="about" class="features">
+            <h2 class="section-title">域名优势</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🏆</div>
+                    <h3>稀缺性</h3>
+                    <p>两字母.md域名全球仅有676个，vlm.md作为其中含义极佳的域名，极具稀缺性和收藏价值，未来增值空间巨大。</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🤖</div>
+                    <h3>AI赛道概念</h3>
+                    <p>VLM是视觉大模型（Vision Large Model）的缩写，完美契合当前AI大模型发展趋势，是AI创业项目的绝佳选择。</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔗</div>
+                    <h3>OpenClaw生态</h3>
+                    <p>深度绑定OpenClaw AI开源生态，随着OpenClaw的火爆，vlm.md的品牌价值和流量价值将持续增长。</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🌐</div>
+                    <h3>通用性强</h3>
+                    <p>.md是markdown的后缀，也是马其顿国家域名，既可以用于技术产品、文档平台，也可以作为国际化项目的主域名。</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💎</div>
+                    <h3>投资回报高</h3>
+                    <p>优质两字母域名长期稳定增值，过去十年两字母域名平均涨幅超过10倍，是数字资产配置的绝佳选择。</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🚀</div>
+                    <h3>即用即得</h3>
+                    <p>域名状态良好，无任何纠纷，购买后可立即转移到您的名下，随时可以用于项目开发或者域名增值持有。</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="value" class="value-section">
+            <div class="value-content">
+                <h2>为什么选择 vlm.md？</h2>
+                <p>在AI大模型爆发的时代，优质的域名是企业的数字名片，更是不可再生的稀缺资源。vlm.md完美契合视觉大模型（VLM）赛道，随着OpenClaw生态的快速发展，这个域名的价值将水涨船高。无论是作为AI创业项目的主域名，还是作为数字资产长期持有，vlm.md都是绝佳的选择。</p>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3>676</h3>
+                        <p>全球两字母.md域名总数</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>10倍+</h3>
+                        <p>过去10年两字母域名平均涨幅</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>万亿级</h3>
+                        <p>AI大模型赛道市场规模</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3>100万+</h3>
+                        <p>OpenClaw生态开发者数量</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="contact" class="contact-section">
+            <h2>有意购买？</h2>
+            <p>如果您对 vlm.md 域名感兴趣，欢迎通过以下方式联系我们询价，我们会在24小时
