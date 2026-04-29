@@ -1,0 +1,47 @@
+---
+interface Props {
+  lang: 'zh' | 'en';
+}
+const { lang } = Astro.props;
+const placeholder = lang === 'zh' ? '搜索食谱...' : 'Search recipes...';
+---
+
+<div id="search" class="w-full max-w-md">
+  <input
+    id="pagefind-search"
+    type="search"
+    placeholder={placeholder}
+    class="w-full px-4 py-2 rounded-lg bg-gray-900 border border-gray-700 text-gray-200 placeholder-gray-500 focus:outline-none focus:border-violet-500 font-mono text-sm"
+  />
+  <div id="pagefind-results" class="mt-2"></div>
+</div>
+
+<script>
+  async function initSearch() {
+    // @ts-ignore — pagefind is injected at build time; use a variable to prevent Rollup from resolving it
+    const pagefindPath = '/pagefind/pagefind.js';
+    // @ts-ignore
+    const pagefind = await import(/* @vite-ignore */ pagefindPath);
+    await pagefind.init();
+
+    const input = document.getElementById('pagefind-search') as HTMLInputElement;
+    const results = document.getElementById('pagefind-results')!;
+
+    input?.addEventListener('input', async () => {
+      const query = input.value.trim();
+      if (!query) { results.innerHTML = ''; return; }
+
+      const search = await pagefind.search(query);
+      const data = await Promise.all(search.results.slice(0, 6).map((r: any) => r.data()));
+
+      results.innerHTML = data.map((d: any) => `
+        <a href="${d.url}" class="block px-3 py-2 rounded hover:bg-gray-800 transition-colors">
+          <div class="text-sm font-medium text-white">${d.meta?.title ?? d.url}</div>
+          <div class="text-xs text-gray-400 line-clamp-1">${d.excerpt}</div>
+        </a>
+      `).join('');
+    });
+  }
+
+  initSearch();
+</script>
