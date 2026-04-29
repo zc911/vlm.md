@@ -4,19 +4,17 @@ import Header from '../../components/Header.astro';
 import Footer from '../../components/Footer.astro';
 import RecipeCard from '../../components/RecipeCard.astro';
 import { getCollection } from 'astro:content';
+import { CATEGORY_META } from '../../content/config';
 
 const lang = 'zh' as const;
 const recipes = await getCollection('recipes', (r) => r.data.lang === 'zh');
-const featured = recipes.slice(0, 3);
+const featured = recipes
+  .sort((a, b) => b.data.date.getTime() - a.data.date.getTime())
+  .slice(0, 3);
 
-const categories = [
-  { key: 'document-understanding', label: '文档理解', icon: '📄' },
-  { key: 'ui-grounding', label: 'UI 操控', icon: '🖱️' },
-  { key: 'chart-table', label: '图表/表格', icon: '📊' },
-  { key: 'computer-use', label: 'Computer Use', icon: '💻' },
-  { key: 'multi-image', label: '多图推理', icon: '🖼️' },
-  { key: 'structured-output', label: '结构化输出', icon: '🗂️' },
-];
+const categories = (Object.entries(CATEGORY_META) as [string, { zh: string; en: string; icon: string }][]).map(
+  ([key, meta]) => ({ key, label: meta.zh, icon: meta.icon })
+);
 ---
 
 <BaseLayout title="VLM 实战食谱库" lang={lang}>

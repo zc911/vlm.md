@@ -34,3 +34,12 @@ export const CATEGORY_LABELS: Record<typeof CATEGORIES[number], { zh: string; en
   'multi-image': { zh: '多图推理', en: 'Multi-image Reasoning' },
   'structured-output': { zh: '结构化输出', en: 'Structured Output' },
 };
+
+export const CATEGORY_META: Record<typeof CATEGORIES[number], { zh: string; en: string; icon: string }> = {
+  'document-understanding': { zh: '文档理解', en: 'Document Understanding', icon: '📄' },
+  'ui-grounding': { zh: 'UI 操控', en: 'UI Grounding', icon: '🖱️' },
+  'chart-table': { zh: '图表/表格', en: 'Chart & Table', icon: '📊' },
+  'computer-use': { zh: 'Computer Use', en: 'Computer Use', icon: '💻' },
+  'multi-image': { zh: '多图推理', en: 'Multi-image Reasoning', icon: '🖼️' },
+  'structured-output': { zh: '结构化输出', en: 'Structured Output', icon: '🗂️' },
+};
