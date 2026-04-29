@@ -28,7 +28,7 @@ const categories = Object.entries(CATEGORY_LABELS).map(([key, labels]) => ({
   <div class="flex gap-2 flex-wrap mb-8" id="category-filters">
     <button
       data-category="all"
-      class="category-btn active px-3 py-1.5 rounded-lg text-sm border border-violet-500 text-violet-400 font-mono"
+      class="category-btn px-3 py-1.5 rounded-lg text-sm border border-violet-500 text-violet-400 font-mono"
     >
       全部
     </button>
@@ -52,18 +52,28 @@ const categories = Object.entries(CATEGORY_LABELS).map(([key, labels]) => ({
 </BaseLayout>
 
 <script>
-  const buttons = document.querySelectorAll<HTMLButtonElement>('.category-btn');
-  const items = document.querySelectorAll<HTMLElement>('.recipe-item');
+  const filterContainer = document.getElementById('category-filters')!;
+  const grid = document.getElementById('recipe-grid')!;
+  const buttons = filterContainer.querySelectorAll<HTMLButtonElement>('.category-btn');
+  const items = grid.querySelectorAll<HTMLElement>('.recipe-item');
 
   buttons.forEach((btn) => {
     btn.addEventListener('click', () => {
       const selected = btn.dataset.category!;
-      buttons.forEach((b) => b.classList.remove('active', 'border-violet-500', 'text-violet-400'));
-      btn.classList.add('active', 'border-violet-500', 'text-violet-400');
+      buttons.forEach((b) => b.classList.remove('border-violet-500', 'text-violet-400'));
+      btn.classList.add('border-violet-500', 'text-violet-400');
       items.forEach((item) => {
         const show = selected === 'all' || item.dataset.category === selected;
         item.style.display = show ? '' : 'none';
       });
     });
   });
+
+  const initial = new URLSearchParams(location.search).get('category');
+  if (initial) {
+    const target = document.querySelector<HTMLButtonElement>(
+      `.category-btn[data-category="${CSS.escape(initial)}"]`
+    );
+    target?.click();
+  }
 </script>
