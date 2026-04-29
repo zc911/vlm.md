@@ -7,7 +7,9 @@ interface Props {
 const { lang, currentPath = '' } = Astro.props;
 
 const otherLang = lang === 'zh' ? 'en' : 'zh';
-const otherPath = currentPath.replace(`/${lang}/`, `/${otherLang}/`);
+const otherPath = currentPath
+  ? currentPath.replace(/^\/(zh|en)(\/|$)/, `/${otherLang}$2`)
+  : '';
 
 const nav = {
   zh: { home: '首页', recipes: '食谱', about: '关于' },
