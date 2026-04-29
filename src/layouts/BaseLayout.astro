@@ -1,0 +1,29 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description?: string;
+  lang?: 'zh' | 'en';
+}
+
+const { title, description = 'VLM recipes for agent developers', lang = 'zh' } = Astro.props;
+---
+
+<!doctype html>
+<html lang={lang}>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>{title} | vlm.md</title>
+  </head>
+  <body class="bg-gray-950 text-gray-100 min-h-screen flex flex-col font-sans">
+    <slot name="header" />
+    <main class="flex-1 max-w-5xl mx-auto w-full px-4 py-8">
+      <slot />
+    </main>
+    <slot name="footer" />
+  </body>
+</html>
