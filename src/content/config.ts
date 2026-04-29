@@ -20,7 +20,6 @@ const recipes = defineCollection({
     difficulty: z.enum(['beginner', 'intermediate', 'advanced']),
     date: z.date(),
     author: z.string().optional(),
-    slug: z.string(),
   }),
 });
 

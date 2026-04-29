@@ -1,0 +1,170 @@
+---
+title: Extract Structured Data from Invoice Images
+description: Have your agent automatically extract vendor, amount, date, and other fields from scanned invoices and output JSON. Includes real production gotchas.
+category: document-understanding
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-29
+author: vlm.md
+---
+
+## Scenario
+
+Your agent needs to process user-uploaded invoice images (PDF scans or phone photos) and automatically extract:
+
+- Vendor name
+- Invoice number
+- Invoice date
+- Subtotal, tax amount, total
+- Payment due date (if present)
+
+Output structured JSON for downstream systems (ERP, accounting software).
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best overall; strong on diverse invoice formats |
+| **Claude 3.5 Sonnet** | Most consistent structured output; lowest JSON error rate |
+| **Gemini 1.5 Pro** | Best value for multi-page or long documents |
+
+For non-English invoices, prefer GPT-4o or Claude. For English invoices, all three perform similarly.
+
+## Prompt Template
+
+```text
+You are an invoice data extraction expert. Extract the following fields from the image and return ONLY valid JSON — no explanation, no markdown.
+
+Required fields:
+- vendor_name: seller/vendor name
+- invoice_number: invoice ID or number
+- invoice_date: date issued (YYYY-MM-DD)
+- subtotal: pre-tax amount (number, no currency symbol)
+- tax_amount: tax amount (number, no currency symbol)
+- total_amount: total including tax (number, no currency symbol)
+- currency: currency code (e.g. USD, EUR, CNY)
+- due_date: payment due date (YYYY-MM-DD, or null if not present)
+
+Return null for any field not found in the image.
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """You are an invoice data extraction expert. Extract the following fields from the image and return ONLY valid JSON — no explanation, no markdown.
+
+Required fields:
+- vendor_name: seller/vendor name
+- invoice_number: invoice ID or number
+- invoice_date: date issued (YYYY-MM-DD)
+- subtotal: pre-tax amount (number, no currency symbol)
+- tax_amount: tax amount (number, no currency symbol)
+- total_amount: total including tax (number, no currency symbol)
+- currency: currency code (e.g. USD, EUR, CNY)
+- due_date: payment due date (YYYY-MM-DD, or null if not present)
+
+Return null for any field not found in the image."""
+
+def extract_invoice(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(suffix, "image/jpeg")
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "You are an invoice extraction assistant. Output JSON only."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=512,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    result = extract_invoice("invoice.jpg")
+    print(json.dumps(result, indent=2))
+```
+
+Run:
+
+```bash
+pip install openai
+python extract_invoice.py
+```
+
+Expected output:
+
+```json
+{
+  "vendor_name": "Acme Corp",
+  "invoice_number": "INV-2024-0042",
+  "invoice_date": "2024-03-15",
+  "subtotal": 1000.00,
+  "tax_amount": 100.00,
+  "total_amount": 1100.00,
+  "currency": "USD",
+  "due_date": "2024-04-15"
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Model wraps JSON in a markdown code block**
+
+Without `response_format={"type": "json_object"}`, GPT-4o sometimes wraps the output in `` ```json ... ``` ``. The code above uses `json_object` mode to prevent this. Note: this mode requires mentioning "JSON" somewhere in the system prompt.
+
+**Gotcha 2: Low-quality or skewed phone photos**
+
+VLMs handle light skew (&lt;15°) well, but image size matters. Pre-resize large images before sending:
+
+```python
+from PIL import Image
+
+def preprocess(path: str) -> str:
+    img = Image.open(path)
+    if max(img.size) > 2048:
+        img.thumbnail((2048, 2048))
+        out = path.replace(".", "_resized.")
+        img.save(out)
+        return out
+    return path
+```
+
+**Gotcha 3: Multi-page PDFs**
+
+The OpenAI API doesn't accept PDF files directly. Convert to images first:
+
+```python
+from pdf2image import convert_from_path
+
+def pdf_to_images(pdf_path: str) -> list[str]:
+    pages = convert_from_path(pdf_path, dpi=200)
+    paths = []
+    for i, page in enumerate(pages):
+        p = f"/tmp/invoice_page_{i}.jpg"
+        page.save(p, "JPEG")
+        paths.append(p)
+    return paths
+```
+
+Extract each page separately, then merge results. For multi-page invoices, the total is usually on the last page.

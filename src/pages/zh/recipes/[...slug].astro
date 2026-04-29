@@ -7,15 +7,17 @@ import { CATEGORY_LABELS } from '../../../content/config';
 
 export async function getStaticPaths() {
   const recipes = await getCollection('recipes', (r) => r.data.lang === 'zh');
-  return recipes.map((recipe) => ({
-    params: { slug: recipe.data.slug },
-    props: { recipe },
-  }));
+  return recipes.map((recipe) => {
+    // Derive slug from entry id: "zh/invoice-extraction.mdx" → "invoice-extraction"
+    const slug = recipe.id.replace(/^[^/]+\//, '').replace(/\.[^.]+$/, '');
+    return { params: { slug }, props: { recipe } };
+  });
 }
 
 const { recipe } = Astro.props;
 const { Content } = await recipe.render();
 const { title, description, category, models, difficulty, date, author } = recipe.data;
+const recipeSlug = recipe.id.replace(/^[^/]+\//, '').replace(/\.[^.]+$/, '');
 const lang = 'zh' as const;
 
 const categoryLabel = CATEGORY_LABELS[category].zh;
@@ -24,7 +26,7 @@ const difficultyColor = { beginner: 'text-green-400', intermediate: 'text-yellow
 ---
 
 <BaseLayout title={title} description={description} lang={lang}>
-  <Header slot="header" lang={lang} currentPath={`/zh/recipes/${recipe.data.slug}`} />
+  <Header slot="header" lang={lang} currentPath={`/zh/recipes/${recipeSlug}`} />
   <Footer slot="footer" lang={lang} />
 
   <article>

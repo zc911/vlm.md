@@ -1,0 +1,174 @@
+---
+title: 从发票图片中提取结构化数据
+description: 让 agent 自动从扫描发票中提取供应商、金额、日期等字段，输出 JSON。包含真实踩坑记录。
+category: document-understanding
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-29
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要处理用户上传的发票图片（PDF 扫描件或手机拍照），并自动提取以下字段：
+
+- 供应商名称
+- 发票号码
+- 开票日期
+- 税前金额、税额、税后总额
+- 付款期限（如有）
+
+最终输出结构化 JSON，供下游系统（ERP、记账软件）使用。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 最均衡，对中文发票支持好 |
+| **Claude 3.5 Sonnet** | 结构化输出更稳定，JSON 格式错误率低 |
+| **Gemini 1.5 Pro** | 处理长文档或多页发票性价比高 |
+
+中文发票优先用 GPT-4o 或 Claude，英文发票三者差距不大。
+
+## Prompt 模板
+
+```text
+你是一个发票信息提取专家。请从图片中提取以下信息，严格按照 JSON 格式返回，不要有任何多余文字。
+
+必须提取的字段：
+- vendor_name: 供应商/卖方名称
+- invoice_number: 发票号码
+- invoice_date: 开票日期 (YYYY-MM-DD 格式)
+- subtotal: 税前金额 (数字，不含货币符号)
+- tax_amount: 税额 (数字，不含货币符号)
+- total_amount: 税后总额 (数字，不含货币符号)
+- currency: 货币代码 (如 CNY, USD)
+- due_date: 付款期限 (YYYY-MM-DD，如无则为 null)
+
+如果某字段在图片中不存在，返回 null。
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+def extract_invoice(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    
+    suffix = Path(image_path).suffix.lower()
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "pdf": "application/pdf"}.get(suffix[1:], "image/jpeg")
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "你是发票提取助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": """你是一个发票信息提取专家。请从图片中提取以下信息，严格按照 JSON 格式返回，不要有任何多余文字。
+
+必须提取的字段：
+- vendor_name: 供应商/卖方名称
+- invoice_number: 发票号码
+- invoice_date: 开票日期 (YYYY-MM-DD 格式)
+- subtotal: 税前金额 (数字，不含货币符号)
+- tax_amount: 税额 (数字，不含货币符号)
+- total_amount: 税后总额 (数字，不含货币符号)
+- currency: 货币代码 (如 CNY, USD)
+- due_date: 付款期限 (YYYY-MM-DD，如无则为 null)
+
+如果某字段在图片中不存在，返回 null。""",
+                    },
+                ],
+            }
+        ],
+        max_tokens=512,
+    )
+    
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    result = extract_invoice("invoice.jpg")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+```
+
+运行：
+
+```bash
+pip install openai
+python extract_invoice.py
+```
+
+预期输出：
+
+```json
+{
+  "vendor_name": "上海某某科技有限公司",
+  "invoice_number": "31234567",
+  "invoice_date": "2024-03-15",
+  "subtotal": 10000.00,
+  "tax_amount": 900.00,
+  "total_amount": 10900.00,
+  "currency": "CNY",
+  "due_date": null
+}
+```
+
+## 踩坑记录
+
+**坑 1：模型返回 markdown 代码块而不是纯 JSON**
+
+GPT-4o 偶尔会在 JSON 外面套一层 `` ```json ... ``` ``，导致 `json.loads()` 失败。使用 `response_format={"type": "json_object"}` 参数可以避免这个问题（需要在 system prompt 中提到 JSON）。
+
+**坑 2：手机拍照的发票倾斜或光线差**
+
+VLM 对轻微倾斜（&lt;15°）容忍度较好，但强烈建议在传给 VLM 前做一次预处理：
+
+```python
+from PIL import Image
+
+def preprocess_image(path: str) -> str:
+    img = Image.open(path)
+    if max(img.size) > 2048:
+        img.thumbnail((2048, 2048))
+        path = path.replace(".", "_resized.")
+        img.save(path)
+    return path
+```
+
+**坑 3：多页 PDF**
+
+OpenAI API 目前不直接支持 PDF 文件。需要先把 PDF 转成图片：
+
+```python
+from pdf2image import convert_from_path
+
+def pdf_to_images(pdf_path: str) -> list[str]:
+    images = convert_from_path(pdf_path, dpi=200)
+    paths = []
+    for i, img in enumerate(images):
+        p = f"/tmp/page_{i}.jpg"
+        img.save(p, "JPEG")
+        paths.append(p)
+    return paths
+```
+
+多页发票建议每页单独提取，再合并结果。
