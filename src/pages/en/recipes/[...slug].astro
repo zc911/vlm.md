@@ -50,7 +50,7 @@ const difficultyColor = { beginner: 'text-green-400', intermediate: 'text-yellow
 
     <div class="prose prose-invert prose-violet max-w-none
       prose-headings:font-semibold prose-headings:text-white
-      prose-code:font-mono prose-code:bg-gray-800 prose-code:text-violet-300 prose-code:px-1 prose-code:rounded
+      prose-code:font-mono [&_:not(pre)>code]:bg-gray-800 [&_:not(pre)>code]:text-violet-300 [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:rounded
       prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-800
       prose-a:text-violet-400 prose-a:no-underline hover:prose-a:underline
       prose-blockquote:border-violet-500 prose-blockquote:text-gray-400">
