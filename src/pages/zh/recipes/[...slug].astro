@@ -1,0 +1,60 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import Header from '../../../components/Header.astro';
+import Footer from '../../../components/Footer.astro';
+import { CATEGORY_LABELS } from '../../../content/config';
+
+export async function getStaticPaths() {
+  const recipes = await getCollection('recipes', (r) => r.data.lang === 'zh');
+  return recipes.map((recipe) => ({
+    params: { slug: recipe.data.slug },
+    props: { recipe },
+  }));
+}
+
+const { recipe } = Astro.props;
+const { Content } = await recipe.render();
+const { title, description, category, models, difficulty, date, author } = recipe.data;
+const lang = 'zh' as const;
+
+const categoryLabel = CATEGORY_LABELS[category].zh;
+const difficultyLabel = { beginner: '入门', intermediate: '进阶', advanced: '高级' }[difficulty] ?? difficulty;
+const difficultyColor = { beginner: 'text-green-400', intermediate: 'text-yellow-400', advanced: 'text-red-400' }[difficulty] ?? 'text-gray-400';
+---
+
+<BaseLayout title={title} description={description} lang={lang}>
+  <Header slot="header" lang={lang} currentPath={`/zh/recipes/${recipe.data.slug}`} />
+  <Footer slot="footer" lang={lang} />
+
+  <article>
+    <div class="mb-8">
+      <div class="flex items-center gap-3 mb-4">
+        <a href="/zh/recipes" class="text-sm text-gray-500 hover:text-violet-400 transition-colors">← 所有食谱</a>
+        <span class="text-gray-700">·</span>
+        <span class="text-sm text-gray-500 font-mono">{categoryLabel}</span>
+        <span class="text-gray-700">·</span>
+        <span class={`text-sm font-mono ${difficultyColor}`}>{difficultyLabel}</span>
+      </div>
+      <h1 class="text-3xl font-bold text-white mb-3">{title}</h1>
+      <p class="text-gray-400 text-lg mb-4">{description}</p>
+      <div class="flex items-center flex-wrap gap-4 text-sm text-gray-500">
+        <span>{date.toLocaleDateString('zh-CN')}</span>
+        {author && <span>· {author}</span>}
+        <span>· 推荐模型：</span>
+        {models.map((m) => (
+          <span class="px-2 py-0.5 rounded bg-gray-800 text-gray-300 font-mono text-xs">{m}</span>
+        ))}
+      </div>
+    </div>
+
+    <div class="prose prose-invert prose-violet max-w-none
+      prose-headings:font-semibold prose-headings:text-white
+      prose-code:font-mono prose-code:bg-gray-800 prose-code:text-violet-300 prose-code:px-1 prose-code:rounded
+      prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-800
+      prose-a:text-violet-400 prose-a:no-underline hover:prose-a:underline
+      prose-blockquote:border-violet-500 prose-blockquote:text-gray-400">
+      <Content />
+    </div>
+  </article>
+</BaseLayout>
