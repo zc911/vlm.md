@@ -6,8 +6,8 @@ interface Props {
 const { lang } = Astro.props;
 
 const text = {
-  zh: { contribute: '贡献食谱', builtWith: '用 Astro 构建，部署于 Cloudflare Pages' },
-  en: { contribute: 'Contribute a Recipe', builtWith: 'Built with Astro, deployed on Cloudflare Pages' },
+  zh: { contribute: '贡献食谱', contact: '联系我', builtWith: '用 Astro 构建，部署于 Cloudflare Pages' },
+  en: { contribute: 'Contribute a Recipe', contact: 'Contact', builtWith: 'Built with Astro, deployed on Cloudflare Pages' },
 }[lang];
 ---
 
@@ -17,6 +17,7 @@ const text = {
     <a href={`https://github.com/vlm-md/vlm.md/blob/main/CONTRIBUTING${lang === 'zh' ? '.zh' : ''}.md`} class="hover:text-violet-400 transition-colors">
       {text.contribute}
     </a>
+    <a href="mailto:zack.mm.chen@gmail.com" class="hover:text-violet-400 transition-colors">{text.contact}</a>
     <span>{text.builtWith}</span>
   </div>
 </footer>
