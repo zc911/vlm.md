@@ -34,12 +34,23 @@ const placeholder = lang === 'zh' ? '搜索食谱...' : 'Search recipes...';
       const search = await pagefind.search(query);
       const data = await Promise.all(search.results.slice(0, 6).map((r: any) => r.data()));
 
-      results.innerHTML = data.map((d: any) => `
-        <a href="${d.url}" class="block px-3 py-2 rounded hover:bg-gray-800 transition-colors">
-          <div class="text-sm font-medium text-white">${d.meta?.title ?? d.url}</div>
-          <div class="text-xs text-gray-400 line-clamp-1">${d.excerpt}</div>
-        </a>
-      `).join('');
+      results.innerHTML = '';
+      for (const d of data) {
+        const link = document.createElement('a');
+        link.href = d.url;
+        link.className = 'block px-3 py-2 rounded hover:bg-gray-800 transition-colors';
+
+        const title = document.createElement('div');
+        title.className = 'text-sm font-medium text-white';
+        title.textContent = d.meta?.title ?? d.url;
+
+        const excerpt = document.createElement('div');
+        excerpt.className = 'text-xs text-gray-400 line-clamp-1';
+        excerpt.innerHTML = d.excerpt;
+
+        link.append(title, excerpt);
+        results.appendChild(link);
+      }
     });
   }
 
