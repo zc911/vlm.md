@@ -1,0 +1,226 @@
+---
+title: 从柱状图中提取数据
+description: 让 agent 从报告、仪表盘或幻灯片中的柱状图图片提取数值数据，输出含标签、数值和系列名称的结构化 JSON。
+category: chart-table
+lang: zh
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要处理来自报告、商业智能仪表盘或演示幻灯片中的柱状图图片，并提取底层数值数据以便进一步分析或跨期对比。目标是输出包含轴标签、数值和系列名称的结构化 JSON，而无需访问原始数据源。
+
+典型用例：
+- 从季报 PDF 中提取收入对比图
+- 对比竞品分析幻灯片中多个系列的柱状图数据
+- 将仪表盘截图中的 KPI 指标录入数据库
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 最均衡；对复杂分组柱状图的系列识别最准确 |
+| **Gemini 1.5 Pro** | 对高密度多系列图表表现好；输出格式稳定 |
+| **Claude 3.5 Sonnet** | JSON 结构最严谨；在不确定时更倾向给出置信度说明 |
+
+对于堆叠柱状图，GPT-4o 和 Claude 3.5 Sonnet 明显优于其他模型。Gemini 在颜色区分上偶有混淆，建议搭配置信度请求使用。
+
+## Prompt 模板
+
+```text
+你是一个图表数据提取专家。请分析这张柱状图，并严格按照下方 JSON 格式返回数据，不要有任何多余文字或解释。
+
+注意事项：
+1. 图表类型：请判断这是「分组柱状图」还是「堆叠柱状图」，在 chart_type 字段注明。
+2. Y 轴范围：请报告 y 轴的最小值和最大值（注意：Y 轴可能不从 0 开始）。
+3. 置信度：如果某个数值因颜色相近或图像分辨率低而难以确认，在该数值的 confidence 字段注明 "low"，否则填 "high"。
+
+返回格式：
+{
+  "chart_type": "grouped | stacked",
+  "x_axis_label": "X 轴标题（如有）",
+  "y_axis_label": "Y 轴标题（如有）",
+  "y_axis_min": 数字,
+  "y_axis_max": 数字,
+  "series": [
+    {
+      "name": "系列名称",
+      "color": "颜色描述，如 blue / red",
+      "data": [
+        {"label": "X 轴标签", "value": 数字, "confidence": "high | low"}
+      ]
+    }
+  ]
+}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """你是一个图表数据提取专家。请分析这张柱状图，并严格按照下方 JSON 格式返回数据，不要有任何多余文字或解释。
+
+注意事项：
+1. 图表类型：请判断这是「分组柱状图」还是「堆叠柱状图」，在 chart_type 字段注明。
+2. Y 轴范围：请报告 y 轴的最小值和最大值（注意：Y 轴可能不从 0 开始）。
+3. 置信度：如果某个数值因颜色相近或图像分辨率低而难以确认，在该数值的 confidence 字段注明 "low"，否则填 "high"。
+
+返回格式：
+{
+  "chart_type": "grouped | stacked",
+  "x_axis_label": "X 轴标题（如有）",
+  "y_axis_label": "Y 轴标题（如有）",
+  "y_axis_min": 数字,
+  "y_axis_max": 数字,
+  "series": [
+    {
+      "name": "系列名称",
+      "color": "颜色描述，如 blue / red",
+      "data": [
+        {"label": "X 轴标签", "value": 数字, "confidence": "high | low"}
+      ]
+    }
+  ]
+}"""
+
+
+def extract_bar_chart(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "你是图表数据提取助手，只输出符合要求的 JSON，不输出任何其他内容。",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def flag_low_confidence(chart_data: dict) -> list[str]:
+    """返回所有低置信度数据点的描述列表。"""
+    warnings = []
+    for series in chart_data.get("series", []):
+        for point in series.get("data", []):
+            if point.get("confidence") == "low":
+                warnings.append(
+                    f"系列「{series['name']}」中 x={point['label']} 的值 {point['value']} 置信度低"
+                )
+    return warnings
+
+
+if __name__ == "__main__":
+    result = extract_bar_chart("bar_chart.png")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    warnings = flag_low_confidence(result)
+    if warnings:
+        print("\n⚠ 低置信度数据点：")
+        for w in warnings:
+            print(" -", w)
+```
+
+运行：
+
+```bash
+pip install openai
+python extract_bar_chart.py
+```
+
+预期输出：
+
+```json
+{
+  "chart_type": "grouped",
+  "x_axis_label": "季度",
+  "y_axis_label": "收入（万元）",
+  "y_axis_min": 0,
+  "y_axis_max": 500,
+  "series": [
+    {
+      "name": "产品 A",
+      "color": "blue",
+      "data": [
+        {"label": "Q1", "value": 320, "confidence": "high"},
+        {"label": "Q2", "value": 410, "confidence": "high"},
+        {"label": "Q3", "value": 375, "confidence": "high"},
+        {"label": "Q4", "value": 490, "confidence": "high"}
+      ]
+    },
+    {
+      "name": "产品 B",
+      "color": "orange",
+      "data": [
+        {"label": "Q1", "value": 210, "confidence": "high"},
+        {"label": "Q2", "value": 265, "confidence": "low"},
+        {"label": "Q3", "value": 300, "confidence": "high"},
+        {"label": "Q4", "value": 340, "confidence": "high"}
+      ]
+    }
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：堆叠柱状图 vs 分组柱状图混淆**
+
+如果不在 prompt 中明确要求模型判断图表类型，它往往会默认按分组柱状图处理堆叠图，导致数值被误读为独立值而非累计值。始终在 prompt 中要求填写 `chart_type` 字段，并在代码层面根据类型对数值做后处理（堆叠图需要将各段值分别记录，而不是取顶部刻度）。
+
+**坑 2：Y 轴不从 0 开始（截断轴）**
+
+当 Y 轴从非零值开始时（如从 200 开始），模型有时会误将视觉上的柱高直接读成绝对值。解决方法是显式要求模型报告 `y_axis_min` 和 `y_axis_max`，然后在代码中验证：如果 `y_axis_min != 0`，提醒下游消费方注意比例视觉误导。
+
+```python
+if result.get("y_axis_min", 0) != 0:
+    print(f"警告：Y 轴从 {result['y_axis_min']} 开始，非零截断轴，视觉比例有放大效果")
+```
+
+**坑 3：颜色相近的分组柱造成系列混淆**
+
+在低对比度或黑白打印的图表中（如深蓝 vs 中蓝），模型对系列归属的判断不稳定。对策：
+1. 在 prompt 中要求模型对每个系列描述颜色
+2. 对置信度为 `"low"` 的数据点标记警告
+3. 如果条件允许，对图片进行预处理提升对比度：
+
+```python
+from PIL import Image, ImageEnhance
+
+def enhance_contrast(path: str, factor: float = 1.5) -> str:
+    img = Image.open(path)
+    enhanced = ImageEnhance.Contrast(img).enhance(factor)
+    out = path.replace(".", "_enhanced.")
+    enhanced.save(out)
+    return out
+```

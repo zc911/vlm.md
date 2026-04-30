@@ -1,0 +1,206 @@
+---
+title: 图片表格转结构化 JSON
+description: 让 agent 从截图、扫描件或幻灯片中的光栅化表格图片提取结构化数据，输出字典列表或 CSV。
+category: chart-table
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 遇到嵌入在截图、扫描文档或演示幻灯片中的表格——不是 HTML 或 Excel，而是光栅化图片。需要将其提取为结构化数据（字典列表或 CSV）供后续使用。
+
+典型用例：
+- 从扫描合同中提取条款费率表
+- 将竞品对比幻灯片中的规格表转为数据库行
+- 处理旧系统截图中的报表数据
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 最均衡；对复杂多级表头识别准确 |
+| **Claude 3.5 Sonnet** | JSON 格式最规范；空单元格处理最一致 |
+| **Gemini 1.5 Pro** | 大表格或多页扫描件性价比高 |
+
+简单表格三者差异不大；表头复杂（合并单元格、多行表头）时优先用 GPT-4o 或 Claude。
+
+## Prompt 模板
+
+```text
+你是一个表格数据提取专家。请从图片中提取表格，严格按照以下 JSON 格式返回，不要有任何多余文字。
+
+规则：
+1. headers：提取所有列标题。如果有合并表头，用「父标题/子标题」格式（如 "销售额/Q1"）。
+2. rows：每行是一个字典，key 为列标题，value 为单元格内容。
+3. 空单元格：用 null 表示真正空白的单元格；如果单元格有内容但无法识别，用 "__UNREADABLE__"。
+4. 数字格式：保留原始格式（如 "1,234.56"），不要转换。
+
+返回格式：
+{
+  "headers": ["列1", "列2", ...],
+  "rows": [
+    {"列1": "值", "列2": "值", ...},
+    ...
+  ],
+  "notes": "任何关于表格结构的备注（如存在合并单元格）"
+}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+import csv
+import io
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """你是一个表格数据提取专家。请从图片中提取表格，严格按照以下 JSON 格式返回，不要有任何多余文字。
+
+规则：
+1. headers：提取所有列标题。如果有合并表头，用「父标题/子标题」格式（如 "销售额/Q1"）。
+2. rows：每行是一个字典，key 为列标题，value 为单元格内容。
+3. 空单元格：用 null 表示真正空白的单元格；如果单元格有内容但无法识别，用 "__UNREADABLE__"。
+4. 数字格式：保留原始格式（如 "1,234.56"），不要转换。
+
+返回格式：
+{
+  "headers": ["列1", "列2", ...],
+  "rows": [
+    {"列1": "值", "列2": "值", ...},
+    ...
+  ],
+  "notes": "任何关于表格结构的备注（如存在合并单元格）"
+}"""
+
+
+def extract_table(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "你是表格提取助手，只输出符合要求的 JSON，不输出任何其他内容。",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=2048,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def table_to_csv(table_data: dict) -> str:
+    """将提取结果转换为 CSV 字符串。"""
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        # 将 null 替换为空字符串以符合 CSV 约定
+        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    return buf.getvalue()
+
+
+def normalize_number(value: str) -> float | None:
+    """尝试将带格式的数字字符串转为浮点数（处理千位分隔符）。"""
+    if value is None or value == "__UNREADABLE__":
+        return None
+    # 处理 1,234.56 格式（英美）
+    cleaned = value.replace(",", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+if __name__ == "__main__":
+    result = extract_table("table_screenshot.png")
+    print("=== JSON 结果 ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    if result.get("notes"):
+        print(f"\n备注：{result['notes']}")
+
+    print("\n=== CSV 格式 ===")
+    print(table_to_csv(result))
+```
+
+运行：
+
+```bash
+pip install openai
+python extract_table.py
+```
+
+预期输出：
+
+```json
+{
+  "headers": ["产品名称", "Q1 销售额", "Q2 销售额", "同比增长"],
+  "rows": [
+    {"产品名称": "产品 A", "Q1 销售额": "1,234,567", "Q2 销售额": "1,456,789", "同比增长": "18.0%"},
+    {"产品名称": "产品 B", "Q1 销售额": "890,000", "Q2 销售额": null, "同比增长": null},
+    {"产品名称": "产品 C", "Q1 销售额": "__UNREADABLE__", "Q2 销售额": "2,100,000", "同比增长": "5.3%"}
+  ],
+  "notes": "原表格 Q2 销售额列存在合并单元格，产品 B 的 Q2 数据为空"
+}
+```
+
+## 踩坑记录
+
+**坑 1：合并表头单元格**
+
+表格顶部有两行表头（如第一行是「销售数据」横跨三列，第二行是「Q1」「Q2」「Q3」）时，如果不做说明，模型通常只提取最后一行表头，丢失父级分组信息。使用 `父标题/子标题` 格式可以保留层级关系，方便后续对列做语义分组。
+
+**坑 2：空单元格 vs 缺失单元格的语义差异**
+
+`null`（真正空白）和 `"__UNREADABLE__"`（有内容但无法识别）是两个不同概念，混淆会导致数据质量问题。在 prompt 中明确区分这两种情况，并在下游处理时分别处理——前者可以填充默认值，后者需要人工复核。
+
+**坑 3：数字格式的地区差异**
+
+不同地区的数字格式不同：`1,234.56`（英美）vs `1.234,56`（欧洲）。如果直接用 `float("1,234.56")` 会报错。建议：
+1. 在 prompt 中要求保留原始格式不做转换
+2. 在代码中根据实际地区做格式化处理
+
+```python
+def parse_localized_number(value: str, locale: str = "en_US") -> float | None:
+    """处理不同地区的数字格式。"""
+    if not value:
+        return None
+    if locale == "en_US":
+        # 1,234.56 -> 1234.56
+        return float(value.replace(",", ""))
+    elif locale == "de_DE":
+        # 1.234,56 -> 1234.56
+        return float(value.replace(".", "").replace(",", "."))
+    return None
+```

@@ -1,0 +1,254 @@
+---
+title: Read Data from Dashboard Screenshots
+description: Have your agent extract KPI values, alert states, and metric readings from Grafana, DataDog, or business analytics dashboard screenshots to trigger downstream actions.
+category: chart-table
+lang: en
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent monitors a dashboard (Grafana, DataDog, business analytics) by taking periodic screenshots and extracting KPI values, alert states, and metric readings to trigger downstream actions — without requiring access to the dashboard's underlying API.
+
+Common use cases:
+- Monitor production SLA metrics and fire Slack alerts when thresholds are breached
+- Extract daily core business metrics from screenshots and write them to a report
+- Sync red/yellow/green alert states to an on-call system
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Most accurate on color-coded alerts and multi-panel layouts |
+| **Gemini 1.5 Pro** | More efficient on large-resolution screenshots (4K dashboards); lower cost |
+
+Claude 3.5 Sonnet performs less consistently in this scenario, especially on dark-theme dashboards (e.g., Grafana's default dark theme).
+
+## Prompt Template
+
+```text
+You are a dashboard data extraction expert. Extract all visible metric data from this dashboard screenshot and return ONLY the JSON below — no explanation, no markdown.
+
+Rules:
+1. Alert colors: For each metric, report the background or status indicator color (red/yellow/green/unknown). Use exact enum values only.
+2. Sparklines: For mini trend charts (sparklines), do NOT guess exact values. Report trend direction only (up/down/flat).
+3. Readability: If a panel cannot be read due to resolution or animation blur, set value to null and explain in notes.
+
+Return format:
+{
+  "dashboard_title": "title or null",
+  "captured_at": "timestamp shown on screenshot, or null",
+  "panels": [
+    {
+      "panel_title": "panel name",
+      "value": "numeric value or status text e.g. 99.9% or CRITICAL",
+      "unit": "unit e.g. % / ms / rps",
+      "status_color": "red | yellow | green | unknown",
+      "trend": "up | down | flat | null (null if no sparkline)",
+      "notes": "any caveats about readability or uncertainty"
+    }
+  ]
+}
+```
+
+## Code
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """You are a dashboard data extraction expert. Extract all visible metric data from this dashboard screenshot and return ONLY the JSON below — no explanation, no markdown.
+
+Rules:
+1. Alert colors: For each metric, report the background or status indicator color (red/yellow/green/unknown). Use exact enum values only.
+2. Sparklines: For mini trend charts (sparklines), do NOT guess exact values. Report trend direction only (up/down/flat).
+3. Readability: If a panel cannot be read due to resolution or animation blur, set value to null and explain in notes.
+
+Return format:
+{
+  "dashboard_title": "title or null",
+  "captured_at": "timestamp shown on screenshot, or null",
+  "panels": [
+    {
+      "panel_title": "panel name",
+      "value": "numeric value or status text e.g. 99.9% or CRITICAL",
+      "unit": "unit e.g. % / ms / rps",
+      "status_color": "red | yellow | green | unknown",
+      "trend": "up | down | flat | null",
+      "notes": "any caveats"
+    }
+  ]
+}"""
+
+
+def extract_dashboard(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a dashboard extraction assistant. Output valid JSON only.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def check_alerts(dashboard_data: dict) -> list[dict]:
+    """Return all panels with red alert status."""
+    return [
+        {
+            "panel": p["panel_title"],
+            "value": p.get("value"),
+            "notes": p.get("notes"),
+        }
+        for p in dashboard_data.get("panels", [])
+        if p.get("status_color") == "red"
+    ]
+
+
+def capture_and_compare(screenshot_paths: list[str]) -> dict[str, list]:
+    """
+    Extract from multiple screenshots and compare values per panel.
+    Useful for detecting mid-animation captures.
+    Returns {panel_title: [value_from_snap1, value_from_snap2, ...]}
+    """
+    comparison: dict[str, list] = {}
+    for path in screenshot_paths:
+        result = extract_dashboard(path)
+        for panel in result.get("panels", []):
+            title = panel["panel_title"]
+            comparison.setdefault(title, []).append(panel.get("value"))
+    return comparison
+
+
+if __name__ == "__main__":
+    result = extract_dashboard("dashboard.png")
+    print(json.dumps(result, indent=2))
+
+    alerts = check_alerts(result)
+    if alerts:
+        print(f"\n{len(alerts)} red alert(s) detected:")
+        for a in alerts:
+            print(f"  - {a['panel']}: {a['value']}")
+    else:
+        print("\nNo red alerts.")
+```
+
+Run:
+
+```bash
+pip install openai
+python extract_dashboard.py
+```
+
+Expected output:
+
+```json
+{
+  "dashboard_title": "Production Monitoring",
+  "captured_at": "2026-04-30 14:23:00",
+  "panels": [
+    {
+      "panel_title": "API Success Rate",
+      "value": "99.2%",
+      "unit": "%",
+      "status_color": "green",
+      "trend": "flat",
+      "notes": null
+    },
+    {
+      "panel_title": "P99 Latency",
+      "value": "847",
+      "unit": "ms",
+      "status_color": "red",
+      "trend": "up",
+      "notes": "Value exceeds 800ms threshold; panel turned red"
+    },
+    {
+      "panel_title": "DB Connections",
+      "value": null,
+      "unit": null,
+      "status_color": "unknown",
+      "trend": null,
+      "notes": "Panel appears blurred, possibly mid-refresh animation"
+    }
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Color-coded alerts require explicit color reporting**
+
+Without asking for `status_color`, the model often reports only the numeric value and omits the alert state — making it impossible to programmatically determine whether to trigger an alert. Always require `status_color` as a fixed enum (`red/yellow/green/unknown`), not a free-text description. Free text like "reddish" or "orange-ish" cannot be reliably parsed.
+
+Dark-theme dashboards (Grafana default) reduce color recognition accuracy. If possible, capture screenshots in light mode, or pre-brighten the image:
+
+```python
+from PIL import Image, ImageEnhance
+
+def brighten(path: str, factor: float = 1.4) -> str:
+    img = Image.open(path)
+    brightened = ImageEnhance.Brightness(img).enhance(factor)
+    out = path.replace(".", "_bright.")
+    brightened.save(out)
+    return out
+```
+
+**Gotcha 2: Sparklines are not suitable for precise readings**
+
+Dashboard sparklines are typically 100-150px wide — far too small for a model to extract reliable exact values. Forcing the model to produce precise numbers leads to hallucinations. The correct approach: explicitly tell the model to report only trend direction (up/down/flat) for sparklines. If you need exact values, call the dashboard's native metrics API directly.
+
+**Gotcha 3: Dynamic dashboards captured mid-animation**
+
+Grafana and similar tools have data refresh animations. A screenshot taken during a transition may show loading spinners or blurred values in some panels. Mitigation:
+
+```python
+import time
+
+def take_stable_screenshots(capture_fn, n: int = 3, interval: float = 2.0) -> list[str]:
+    """
+    Take n screenshots with interval seconds between each.
+    Pass the paths to capture_and_compare() to find consistent readings.
+    """
+    paths = []
+    for i in range(n):
+        path = f"/tmp/dashboard_snap_{i}.png"
+        capture_fn(path)  # your screenshotting function
+        paths.append(path)
+        if i &lt; n - 1:
+            time.sleep(interval)
+    return paths
+```
+
+For any panel where `value` is `null` across multiple snapshots, flag for retry or manual review rather than treating as a legitimate zero or missing value.

@@ -1,0 +1,229 @@
+---
+title: Extract Data from Bar Charts
+description: Have your agent pull numerical data — labels, values, series names — out of bar chart images from reports, dashboards, or slides and return structured JSON.
+category: chart-table
+lang: en
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent receives bar chart images embedded in reports, BI dashboards, or presentation slides and needs to extract the underlying numerical data for further analysis or cross-period comparison — without access to the original data source.
+
+Common use cases:
+- Pull revenue comparison charts out of quarterly PDF reports
+- Extract multi-series bar data from competitor analysis decks
+- Feed KPI values from dashboard screenshots into a database
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best overall; most accurate series identification on complex grouped charts |
+| **Gemini 1.5 Pro** | Strong on dense multi-series charts; consistent output formatting |
+| **Claude 3.5 Sonnet** | Strictest JSON structure; more likely to volunteer confidence caveats |
+
+For stacked bar charts, GPT-4o and Claude 3.5 Sonnet outperform Gemini noticeably. Gemini occasionally confuses colors in low-contrast palettes — always request a confidence field when using it.
+
+## Prompt Template
+
+```text
+You are a chart data extraction expert. Analyze this bar chart and return ONLY the JSON below — no explanation, no markdown.
+
+Instructions:
+1. Chart type: Determine whether this is a "grouped" or "stacked" bar chart and set chart_type accordingly.
+2. Y-axis range: Report the y_axis_min and y_axis_max values. Note that the axis may NOT start at zero.
+3. Confidence: If a value is hard to read due to similar colors or low resolution, set confidence to "low"; otherwise "high".
+
+Return format:
+{
+  "chart_type": "grouped | stacked",
+  "x_axis_label": "label or null",
+  "y_axis_label": "label or null",
+  "y_axis_min": number,
+  "y_axis_max": number,
+  "series": [
+    {
+      "name": "series name",
+      "color": "color description, e.g. blue / red",
+      "data": [
+        {"label": "x-axis label", "value": number, "confidence": "high | low"}
+      ]
+    }
+  ]
+}
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """You are a chart data extraction expert. Analyze this bar chart and return ONLY the JSON below — no explanation, no markdown.
+
+Instructions:
+1. Chart type: Determine whether this is a "grouped" or "stacked" bar chart and set chart_type accordingly.
+2. Y-axis range: Report the y_axis_min and y_axis_max values. Note that the axis may NOT start at zero.
+3. Confidence: If a value is hard to read due to similar colors or low resolution, set confidence to "low"; otherwise "high".
+
+Return format:
+{
+  "chart_type": "grouped | stacked",
+  "x_axis_label": "label or null",
+  "y_axis_label": "label or null",
+  "y_axis_min": number,
+  "y_axis_max": number,
+  "series": [
+    {
+      "name": "series name",
+      "color": "color description, e.g. blue / red",
+      "data": [
+        {"label": "x-axis label", "value": number, "confidence": "high | low"}
+      ]
+    }
+  ]
+}"""
+
+
+def extract_bar_chart(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a chart extraction assistant. Output valid JSON only.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def flag_low_confidence(chart_data: dict) -> list[str]:
+    """Return descriptions of all low-confidence data points."""
+    warnings = []
+    for series in chart_data.get("series", []):
+        for point in series.get("data", []):
+            if point.get("confidence") == "low":
+                warnings.append(
+                    f"Series '{series['name']}': x={point['label']} value={point['value']} is low confidence"
+                )
+    return warnings
+
+
+if __name__ == "__main__":
+    result = extract_bar_chart("bar_chart.png")
+    print(json.dumps(result, indent=2))
+
+    warnings = flag_low_confidence(result)
+    if warnings:
+        print("\nLow-confidence data points:")
+        for w in warnings:
+            print(" -", w)
+```
+
+Run:
+
+```bash
+pip install openai
+python extract_bar_chart.py
+```
+
+Expected output:
+
+```json
+{
+  "chart_type": "grouped",
+  "x_axis_label": "Quarter",
+  "y_axis_label": "Revenue ($K)",
+  "y_axis_min": 0,
+  "y_axis_max": 500,
+  "series": [
+    {
+      "name": "Product A",
+      "color": "blue",
+      "data": [
+        {"label": "Q1", "value": 320, "confidence": "high"},
+        {"label": "Q2", "value": 410, "confidence": "high"},
+        {"label": "Q3", "value": 375, "confidence": "high"},
+        {"label": "Q4", "value": 490, "confidence": "high"}
+      ]
+    },
+    {
+      "name": "Product B",
+      "color": "orange",
+      "data": [
+        {"label": "Q1", "value": 210, "confidence": "high"},
+        {"label": "Q2", "value": 265, "confidence": "low"},
+        {"label": "Q3", "value": 300, "confidence": "high"},
+        {"label": "Q4", "value": 340, "confidence": "high"}
+      ]
+    }
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Stacked vs grouped bar chart confusion**
+
+Without explicitly asking the model to identify the chart type, it defaults to treating stacked bars as grouped — causing each segment to be read as an independent absolute value instead of a part of a cumulative total. Always require `chart_type` in your output schema and post-process accordingly: for stacked charts, each segment value is a portion, not an independent measurement.
+
+**Gotcha 2: Truncated y-axis (doesn't start at zero)**
+
+When the y-axis starts at a non-zero value (e.g., 200), models sometimes read bar heights relative to the visual canvas rather than the axis scale. The fix: require the model to report `y_axis_min` and `y_axis_max`, then validate and warn downstream consumers:
+
+```python
+if result.get("y_axis_min", 0) != 0:
+    print(
+        f"Warning: y-axis starts at {result['y_axis_min']}, "
+        "not zero — visual proportions are misleading"
+    )
+```
+
+**Gotcha 3: Low-contrast colors cause series misattribution**
+
+In charts with similar hues (dark blue vs medium blue) or greyscale prints, the model can assign bars to the wrong series. Mitigations:
+1. Ask the model to describe each series color in the output
+2. Flag all `"confidence": "low"` data points for manual review
+3. Pre-process the image to boost contrast before sending:
+
+```python
+from PIL import Image, ImageEnhance
+
+def enhance_contrast(path: str, factor: float = 1.5) -> str:
+    img = Image.open(path)
+    enhanced = ImageEnhance.Contrast(img).enhance(factor)
+    out = path.replace(".", "_enhanced.")
+    enhanced.save(out)
+    return out
+```

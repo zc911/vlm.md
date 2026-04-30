@@ -1,0 +1,255 @@
+---
+title: 仪表盘截图数据读取
+description: 让 agent 通过截图从 Grafana、DataDog 等仪表盘提取 KPI 数值、告警状态和指标读数，以触发下游动作。
+category: chart-table
+lang: zh
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 监控 Grafana、DataDog 或业务分析仪表盘，通过定期截图提取 KPI 数值、告警状态和指标读数，从而触发下游动作（告警通知、自动工单、报告生成）——无需访问仪表盘的底层 API。
+
+典型用例：
+- 监控生产环境服务 SLA 指标，超阈值时发送 Slack 告警
+- 每日截图提取业务核心指标并写入报表
+- 将红/黄/绿告警状态同步到值班系统
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 对颜色编码告警和多面板布局识别最准确 |
+| **Gemini 1.5 Pro** | 大分辨率截图（4K 仪表盘）处理更高效；成本更低 |
+
+Claude 3.5 Sonnet 在此场景下表现不如前两者稳定，尤其对深色主题仪表盘（如 Grafana 默认深色主题）的识别率偏低。
+
+## Prompt 模板
+
+```text
+你是一个仪表盘数据提取专家。请从这张仪表盘截图中提取所有可见的指标数据，严格按照以下 JSON 格式返回，不要有任何多余文字。
+
+提取规则：
+1. 告警颜色：对每个指标，报告其背景色或状态指示器颜色（red/yellow/green/unknown）。
+2. 趋势图：对于迷你折线图（sparkline）或小型趋势图，不要猜测具体数值，只报告趋势方向（up/down/flat）。
+3. 可读性：如果某个面板因分辨率或动画模糊无法读取，在 value 字段填 null，并在 notes 字段说明原因。
+
+返回格式：
+{
+  "dashboard_title": "仪表盘标题（如有）",
+  "captured_at": "截图时刻描述（如图中有时间戳）",
+  "panels": [
+    {
+      "panel_title": "面板名称",
+      "value": "数值或状态文字，如 99.9% 或 CRITICAL",
+      "unit": "单位，如 % / ms / rps",
+      "status_color": "red | yellow | green | unknown",
+      "trend": "up | down | flat | null（无趋势图则为 null）",
+      "notes": "备注，如数值模糊、单位不确定等"
+    }
+  ]
+}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """你是一个仪表盘数据提取专家。请从这张仪表盘截图中提取所有可见的指标数据，严格按照以下 JSON 格式返回，不要有任何多余文字。
+
+提取规则：
+1. 告警颜色：对每个指标，报告其背景色或状态指示器颜色（red/yellow/green/unknown）。
+2. 趋势图：对于迷你折线图（sparkline）或小型趋势图，不要猜测具体数值，只报告趋势方向（up/down/flat）。
+3. 可读性：如果某个面板因分辨率或动画模糊无法读取，在 value 字段填 null，并在 notes 字段说明原因。
+
+返回格式：
+{
+  "dashboard_title": "仪表盘标题（如有）",
+  "captured_at": "截图时刻描述（如图中有时间戳）",
+  "panels": [
+    {
+      "panel_title": "面板名称",
+      "value": "数值或状态文字，如 99.9% 或 CRITICAL",
+      "unit": "单位，如 % / ms / rps",
+      "status_color": "red | yellow | green | unknown",
+      "trend": "up | down | flat | null",
+      "notes": "备注"
+    }
+  ]
+}"""
+
+
+def extract_dashboard(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "你是仪表盘数据提取助手，只输出符合要求的 JSON，不输出任何其他内容。",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def check_alerts(dashboard_data: dict) -> list[dict]:
+    """返回所有红色告警面板。"""
+    alerts = []
+    for panel in dashboard_data.get("panels", []):
+        if panel.get("status_color") == "red":
+            alerts.append({
+                "panel": panel["panel_title"],
+                "value": panel.get("value"),
+                "notes": panel.get("notes"),
+            })
+    return alerts
+
+
+def capture_and_compare(screenshot_paths: list[str]) -> dict:
+    """
+    对多张截图分别提取，比较数值是否一致（用于动画捕获场景）。
+    返回各面板在多次截图中的数值列表。
+    """
+    results = [extract_dashboard(p) for p in screenshot_paths]
+    comparison: dict[str, list] = {}
+    for result in results:
+        for panel in result.get("panels", []):
+            title = panel["panel_title"]
+            comparison.setdefault(title, []).append(panel.get("value"))
+    return comparison
+
+
+if __name__ == "__main__":
+    # 单张截图提取
+    result = extract_dashboard("dashboard.png")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # 检查告警
+    alerts = check_alerts(result)
+    if alerts:
+        print(f"\n🔴 发现 {len(alerts)} 个红色告警：")
+        for a in alerts:
+            print(f"  - {a['panel']}: {a['value']}")
+    else:
+        print("\n✅ 无红色告警")
+```
+
+运行：
+
+```bash
+pip install openai
+python extract_dashboard.py
+```
+
+预期输出：
+
+```json
+{
+  "dashboard_title": "生产环境监控",
+  "captured_at": "2026-04-30 14:23:00",
+  "panels": [
+    {
+      "panel_title": "API 成功率",
+      "value": "99.2%",
+      "unit": "%",
+      "status_color": "green",
+      "trend": "flat",
+      "notes": null
+    },
+    {
+      "panel_title": "P99 延迟",
+      "value": "847",
+      "unit": "ms",
+      "status_color": "red",
+      "trend": "up",
+      "notes": "数值接近告警阈值 800ms，已变红"
+    },
+    {
+      "panel_title": "数据库连接数",
+      "value": null,
+      "unit": null,
+      "status_color": "unknown",
+      "trend": null,
+      "notes": "面板图像模糊，可能正在刷新动画中"
+    }
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：颜色编码告警判断不稳定**
+
+如果不明确要求报告颜色，模型有时只描述数值而不说明告警状态，导致无法自动判断是否触发下游告警。始终在 prompt 中要求 `status_color` 字段，并只接受固定枚举值（`red/yellow/green/unknown`），不接受自然语言描述（如「偏红」「橙色」）。
+
+对深色主题仪表盘（Grafana 默认主题），建议截图前切换为浅色主题，或对图片做亮度增强：
+
+```python
+from PIL import Image, ImageEnhance
+
+def brighten(path: str, factor: float = 1.4) -> str:
+    img = Image.open(path)
+    brightened = ImageEnhance.Brightness(img).enhance(factor)
+    out = path.replace(".", "_bright.")
+    brightened.save(out)
+    return out
+```
+
+**坑 2：迷你图（Sparkline）不适合精确读数**
+
+仪表盘中的 Sparkline 面积通常很小（宽 100-150px），模型很难从中读出精确数值。强行要求精确数值会导致模型产生幻觉。正确做法：在 prompt 中明确要求只报告趋势方向（up/down/flat），不要求具体数值。如需精确数值，应调用仪表盘的原生 API。
+
+**坑 3：动态仪表盘截图时机问题**
+
+Grafana 等仪表盘有数据刷新动画，截图时如果恰好在动画过渡期，某些面板会显示加载状态或数值模糊。解决方案：
+
+```python
+import time
+
+def capture_stable_screenshot(capture_fn, screenshot_paths_out: list, n: int = 3, interval: float = 2.0):
+    """
+    连续截取 n 张截图，间隔 interval 秒。
+    返回读数最一致的结果（取出现次数最多的数值）。
+    """
+    snapshots = []
+    for i in range(n):
+        path = f"/tmp/dashboard_snap_{i}.png"
+        capture_fn(path)  # 你的截图函数
+        screenshot_paths_out.append(path)
+        if i &lt; n - 1:
+            time.sleep(interval)
+    return screenshot_paths_out
+```
+
+对提取结果中 `value` 为 `null` 的面板，重新截图后再次提取。

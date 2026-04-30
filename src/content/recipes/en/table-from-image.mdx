@@ -1,0 +1,206 @@
+---
+title: Convert Image Tables to Structured JSON
+description: Have your agent extract tables from screenshots, scanned documents, or presentation slides and return them as a list of dicts or CSV.
+category: chart-table
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent encounters tables embedded in screenshots, scanned documents, or presentation slides — not as HTML or Excel data, but as rasterized images. You need to extract them as structured data (list of dicts or CSV) for downstream processing.
+
+Common use cases:
+- Extract fee rate tables from scanned contracts
+- Convert spec comparison tables in competitor slide decks to database rows
+- Process report data from legacy system screenshots
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best overall; most accurate on complex multi-level headers |
+| **Claude 3.5 Sonnet** | Most consistent JSON formatting; best handling of empty cells |
+| **Gemini 1.5 Pro** | Best value for large tables or multi-page scanned documents |
+
+For simple tables all three are comparable. When headers are complex (merged cells, multi-row headers), prefer GPT-4o or Claude.
+
+## Prompt Template
+
+```text
+You are a table data extraction expert. Extract the table from the image and return ONLY the JSON below — no explanation, no markdown.
+
+Rules:
+1. headers: Extract all column headers. For merged/spanning headers use "ParentHeader/ChildHeader" format (e.g. "Sales/Q1").
+2. rows: Each row is a dict with column headers as keys.
+3. Empty cells: Use null for genuinely empty cells. Use "__UNREADABLE__" if there is content you cannot read.
+4. Number formatting: Preserve the original format (e.g. "1,234.56") — do not convert.
+
+Return format:
+{
+  "headers": ["col1", "col2", ...],
+  "rows": [
+    {"col1": "value", "col2": "value", ...},
+    ...
+  ],
+  "notes": "Any notes about table structure such as merged cells"
+}
+```
+
+## Code
+
+```python
+import base64
+import json
+import csv
+import io
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+PROMPT = """You are a table data extraction expert. Extract the table from the image and return ONLY the JSON below — no explanation, no markdown.
+
+Rules:
+1. headers: Extract all column headers. For merged/spanning headers use "ParentHeader/ChildHeader" format (e.g. "Sales/Q1").
+2. rows: Each row is a dict with column headers as keys.
+3. Empty cells: Use null for genuinely empty cells. Use "__UNREADABLE__" if there is content you cannot read.
+4. Number formatting: Preserve the original format (e.g. "1,234.56") — do not convert.
+
+Return format:
+{
+  "headers": ["col1", "col2", ...],
+  "rows": [
+    {"col1": "value", "col2": "value", ...},
+    ...
+  ],
+  "notes": "Any notes about table structure such as merged cells"
+}"""
+
+
+def extract_table(image_path: str) -> dict:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a table extraction assistant. Output valid JSON only.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            },
+        ],
+        max_tokens=2048,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def table_to_csv(table_data: dict) -> str:
+    """Convert extracted table to a CSV string."""
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        # Replace null with empty string for CSV convention
+        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    return buf.getvalue()
+
+
+def parse_number(value: str, locale: str = "en_US") -> float | None:
+    """Parse a locale-formatted number string to float."""
+    if value is None or value == "__UNREADABLE__":
+        return None
+    if locale == "en_US":
+        # "1,234.56" -> 1234.56
+        return float(value.replace(",", "").strip())
+    elif locale == "de_DE":
+        # "1.234,56" -> 1234.56
+        return float(value.replace(".", "").replace(",", ".").strip())
+    return None
+
+
+if __name__ == "__main__":
+    result = extract_table("table_screenshot.png")
+    print("=== JSON result ===")
+    print(json.dumps(result, indent=2))
+
+    if result.get("notes"):
+        print(f"\nNotes: {result['notes']}")
+
+    print("\n=== CSV format ===")
+    print(table_to_csv(result))
+```
+
+Run:
+
+```bash
+pip install openai
+python extract_table.py
+```
+
+Expected output:
+
+```json
+{
+  "headers": ["Product", "Q1 Revenue", "Q2 Revenue", "YoY Growth"],
+  "rows": [
+    {"Product": "Product A", "Q1 Revenue": "1,234,567", "Q2 Revenue": "1,456,789", "YoY Growth": "18.0%"},
+    {"Product": "Product B", "Q1 Revenue": "890,000", "Q2 Revenue": null, "YoY Growth": null},
+    {"Product": "Product C", "Q1 Revenue": "__UNREADABLE__", "Q2 Revenue": "2,100,000", "YoY Growth": "5.3%"}
+  ],
+  "notes": "Original table has a merged header cell spanning Q1-Q3 columns; Product B Q2 cell is blank"
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Merged header cells**
+
+When a table has two header rows (e.g., row 1 is "Sales Data" spanning three columns, row 2 is "Q1", "Q2", "Q3"), models typically extract only the bottom row and drop the grouping context. Using the `Parent/Child` header format preserves the hierarchy so downstream code can group columns semantically.
+
+**Gotcha 2: Empty cells vs missing cells are different**
+
+`null` (genuinely blank) and `"__UNREADABLE__"` (content present but illegible) are semantically different. Conflating them causes data quality issues: blank cells can be filled with defaults; unreadable cells need human review. The prompt above explicitly distinguishes them — make sure your post-processing does too.
+
+**Gotcha 3: Number format locale differences**
+
+`1,234.56` (US/UK) and `1.234,56` (Germany/Brazil) use opposite separators. Calling `float("1,234.56")` raises a `ValueError`. The safest approach:
+1. Ask the model to preserve the original format unchanged
+2. Parse with locale-aware logic in code:
+
+```python
+def parse_number(value: str, locale: str = "en_US") -> float | None:
+    if not value:
+        return None
+    if locale == "en_US":
+        return float(value.replace(",", ""))
+    elif locale == "de_DE":
+        return float(value.replace(".", "").replace(",", "."))
+    return None
+```
+
+If the source locale is unknown, log the raw string and defer conversion until locale is confirmed rather than guessing.
