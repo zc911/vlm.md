@@ -1,0 +1,286 @@
+---
+title: Extract Nested Structured Data from Images
+description: Extract hierarchically structured information from images (org charts, nested tables, multi-level forms, tree diagrams) as nested JSON while preserving the full hierarchy.
+category: structured-output
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: advanced
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+The image contains hierarchically structured information and your agent must extract it as nested JSON that preserves the hierarchy. Typical cases:
+
+- **Org charts**: CEO &rarr; VP &rarr; Director &rarr; Manager multi-level reporting chains
+- **Nested tables**: sub-headers under main headers, merged cells representing groups
+- **Multi-level forms**: Section &rarr; SubSection &rarr; Field three-level structure
+- **Tree diagrams / mind maps**: nodes with children at arbitrary depth
+
+The challenge: the model must simultaneously understand visual spatial relationships (indentation, connecting lines, merged cells) and semantic hierarchy.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Strongest combined visual-semantic understanding; best for complex org charts |
+| **Claude 3.5 Sonnet** | More consistent nested JSON output; fewer errors at deeper levels |
+
+For structures deeper than 3 levels, prefer GPT-4o. When output format consistency matters most, use Claude 3.5 Sonnet.
+
+## Prompt Template
+
+**Strategy A: Direct nested JSON (for structures &lt;= 3 levels deep)**
+
+```text
+Extract the hierarchical structure from the image and return it as nested JSON. Maximum nesting depth is 3 levels.
+
+Each node structure:
+{
+  "id": "unique identifier (alphanumeric)",
+  "name": "node name",
+  "attributes": {},  // additional properties (title, department, etc.)
+  "children": []     // child nodes; empty array for leaf nodes
+}
+
+If the hierarchy exceeds 3 levels, flatten anything below level 3 into that level-3 node's attributes field.
+Output only the JSON object — no extra text or explanation.
+```
+
+**Strategy B: Flat list + parent_id (for arbitrary depth — recommended for org charts)**
+
+```text
+Extract the hierarchical structure from the image and return it as a flat JSON array (one record per node, with parent_id encoding the hierarchy).
+
+Each record structure:
+{
+  "id": "unique node ID (e.g. node_1, node_2)",
+  "name": "node name",
+  "parent_id": "parent node ID, or null for the root",
+  "level": depth level (0 for root),
+  "attributes": {}  // title, department, headcount, etc.
+}
+
+Return format: {"nodes": [...]}
+Output only the JSON — no extra text.
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Any
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+client = OpenAI()
+
+
+# Strategy B: flat node model (recommended for arbitrary-depth structures)
+class FlatNode(BaseModel):
+    id: str
+    name: str
+    parent_id: Optional[str] = None
+    level: int
+    attributes: dict[str, Any] = {}
+
+
+class FlatTree(BaseModel):
+    nodes: list[FlatNode]
+
+
+def extract_nested_structure(
+    image_path: str,
+    strategy: str = "flat",  # "flat" or "nested"
+    max_retries: int = 3,
+) -> "FlatTree | dict":
+    """
+    Extract a hierarchical structure from an image.
+
+    strategy="flat"   : flat list + parent_id, handles arbitrary depth
+    strategy="nested" : direct nested JSON, suitable for <= 3 levels
+    """
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    if strategy == "flat":
+        prompt = """Extract the hierarchical structure from the image as a flat JSON array (one record per node, parent_id encodes the hierarchy).
+
+Each record: {"id": "unique ID", "name": "node name", "parent_id": "parent ID or null for root", "level": depth (0=root), "attributes": {}}
+
+Return format: {"nodes": [...]}
+Output only JSON — no extra text."""
+    else:
+        prompt = """Extract the hierarchical structure from the image as nested JSON. Maximum depth: 3 levels.
+
+Each node: {"id": "unique ID", "name": "name", "attributes": {}, "children": [child nodes]}
+
+If the hierarchy is deeper than 3 levels, flatten deeper content into the level-3 node's attributes.
+Output only JSON — no extra text."""
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a hierarchical data extraction expert. Output strictly valid JSON.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                },
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            response_format={"type": "json_object"},
+            messages=messages,
+            max_tokens=2048,
+        )
+
+        raw = response.choices[0].message.content
+
+        try:
+            data = json.loads(raw)
+
+            if strategy == "flat":
+                return FlatTree.model_validate(data)
+            else:
+                return data  # nested strategy returns dict directly
+
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Validation failed (attempt {attempt + 1}): {e}. "
+                        "Please fix and return the complete corrected JSON. "
+                        "Ensure every parent_id references an existing node id, "
+                        "and the root node has parent_id: null."
+                    ),
+                }
+            )
+
+    raise RuntimeError(f"Failed after {max_retries} attempts. Last error: {last_error}")
+
+
+def tree_to_nested(flat: FlatTree) -> dict:
+    """Reconstruct a nested tree from a flat node list (for display purposes)."""
+    node_map = {n.id: {**n.model_dump(), "children": []} for n in flat.nodes}
+    root = None
+
+    for node in flat.nodes:
+        if node.parent_id is None:
+            root = node_map[node.id]
+        else:
+            parent = node_map.get(node.parent_id)
+            if parent:
+                parent["children"].append(node_map[node.id])
+
+    return root or {}
+
+
+def validate_tree_integrity(flat: FlatTree) -> list[str]:
+    """Validate flat tree integrity. Returns a list of error messages."""
+    errors = []
+    ids = {n.id for n in flat.nodes}
+
+    for node in flat.nodes:
+        if node.parent_id and node.parent_id not in ids:
+            errors.append(
+                f"Node {node.id!r} references non-existent parent_id={node.parent_id!r}"
+            )
+
+    roots = [n for n in flat.nodes if n.parent_id is None]
+    if len(roots) == 0:
+        errors.append("No root node found (no node with parent_id=null)")
+    elif len(roots) > 1:
+        errors.append(f"Multiple root nodes found: {[r.id for r in roots]}")
+
+    return errors
+
+
+if __name__ == "__main__":
+    result = extract_nested_structure("org_chart.png", strategy="flat")
+
+    # Validate tree integrity before using
+    errors = validate_tree_integrity(result)
+    if errors:
+        print("Tree validation warnings:")
+        for err in errors:
+            print(f"  - {err}")
+
+    # Reconstruct nested tree for display
+    nested = tree_to_nested(result)
+    print(json.dumps(nested, indent=2))
+```
+
+Example flat output (org chart):
+
+```json
+{
+  "nodes": [
+    {"id": "node_1", "name": "Alice Chen (CEO)", "parent_id": null, "level": 0, "attributes": {"title": "CEO"}},
+    {"id": "node_2", "name": "Bob Kim (CTO)", "parent_id": "node_1", "level": 1, "attributes": {"title": "CTO"}},
+    {"id": "node_3", "name": "Carol Liu (Engineering)", "parent_id": "node_2", "level": 2, "attributes": {"title": "VP Engineering", "headcount": 20}},
+    {"id": "node_4", "name": "Dan Park (QA)", "parent_id": "node_2", "level": 2, "attributes": {"title": "QA Director", "headcount": 8}},
+    {"id": "node_5", "name": "Eve Torres (Product)", "parent_id": "node_1", "level": 1, "attributes": {"title": "VP Product"}}
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Models confuse parent-child relationships beyond 3 levels of nesting**
+
+When nesting exceeds 3 levels, models frequently misattribute parents — placing level-4 or level-5 nodes under the wrong parent, or accidentally promoting a sibling to a parent role.
+
+Fix: explicitly cap depth at 3 in the prompt and instruct the model to flatten deeper content into `attributes`. Alternatively, switch to Strategy B (flat + `parent_id`). The flat approach reduces errors dramatically because the model only needs to track one local relationship per node rather than the full global nesting.
+
+```text
+# Add to prompt when using Strategy A:
+"If nesting exceeds 3 levels, merge deeper content into the level-3 node's
+attributes field. Do not nest further."
+```
+
+**Gotcha 2: Recursive structures like org charts — use flat parent_id instead**
+
+Org chart depth is unbounded. Asking the model to output deeply nested JSON for arbitrary hierarchies produces increasingly unreliable results as depth grows. The flat approach is more reliable because the model handles one "who is my parent?" question per node instead of constructing a correct global tree shape.
+
+Rebuild the tree in code after extraction using `tree_to_nested()`.
+
+**Gotcha 3: Ambiguous parent-child relationships — instruct the model to flag, not guess**
+
+Images sometimes have visual ambiguity: unclear connecting lines, irregular indentation, or nodes that could plausibly belong to multiple parents. The model will guess rather than admit uncertainty.
+
+Fix: tell the model explicitly to flag ambiguous relationships:
+
+```text
+If a node's parent is unclear from the image, set parent_id to null and add
+"ambiguous_parent": true in its attributes field. Do not guess uncertain relationships.
+```
+
+Then handle flagged nodes in code:
+
+```python
+ambiguous = [n for n in result.nodes if n.attributes.get("ambiguous_parent")]
+if ambiguous:
+    print(f"Nodes needing manual review: {[n.name for n in ambiguous]}")
+```

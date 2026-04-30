@@ -1,0 +1,313 @@
+---
+title: Enforce JSON Schema Output from VLMs
+description: Make a VLM return data that strictly conforms to a predefined JSON schema — matching specific field names, types, and required fields — for integration with typed systems like databases, APIs, and TypeScript types.
+category: structured-output
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent needs a VLM to return data that strictly conforms to a predefined JSON schema — not just "valid JSON," but output matching specific field names, value types, and required-field constraints. Common cases:
+
+- Output written directly to a database (field names must match column names)
+- Output passed to a downstream API (strict request body schema)
+- Output consumed by TypeScript types (runtime validation failures will crash)
+
+Compared to "just output JSON," this requires **field-level type safety**.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Native `response_format` + JSON Schema support; enforces schema at inference time; first choice |
+| **Claude 3.5 Sonnet** | No native schema constraint; combine with Pydantic retry loop for good results |
+| **Gemini 1.5 Pro** | Supports `response_schema`; good value for long-document extraction |
+
+For precision-critical production pipelines, prefer GPT-4o Structured Outputs. For other models, use Pydantic validation with a retry loop as the fallback.
+
+## Prompt Template
+
+```text
+You are a structured data extraction expert. Extract information from the image and return it strictly according to the JSON schema below. Do not output any extra text.
+
+Schema rules:
+- All required fields must be present
+- Value types must strictly match (numbers must not be strings; enum values must match exactly)
+- Optional fields not found in the image should be returned as null
+
+Output the JSON object directly — do not wrap it in a markdown code block.
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Literal
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+client = OpenAI()
+
+
+# Define the Pydantic model (used for both validation and JSON Schema generation)
+class ProductInfo(BaseModel):
+    product_name: str
+    sku: str
+    price: float
+    currency: Literal["USD", "EUR", "GBP", "CNY"]
+    in_stock: bool
+    category: Optional[str] = None
+    discount_percent: Optional[float] = None
+
+
+def build_json_schema(model: type[BaseModel]) -> dict:
+    schema = model.model_json_schema()
+    # OpenAI Structured Outputs requires additionalProperties: false
+    # Warning: this causes models to omit fields they're unsure about
+    # Production tip: use Optional + null instead of prohibiting extra fields
+    schema["additionalProperties"] = False
+    return schema
+
+
+def extract_with_schema(
+    image_path: str,
+    max_retries: int = 3,
+) -> ProductInfo:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    schema = build_json_schema(ProductInfo)
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a structured data extraction assistant. Output strictly according to the JSON schema.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                },
+                {
+                    "type": "text",
+                    "text": "Extract product information from the image. Return only a JSON object matching the schema.",
+                },
+            ],
+        },
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            # Option 1: OpenAI Structured Outputs (GPT-4o native support)
+            response = client.chat.completions.create(
+                model="gpt-4o-2024-08-06",  # Structured Outputs requires this version or newer
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ProductInfo",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+                messages=messages,
+                max_tokens=512,
+            )
+
+            raw = response.choices[0].message.content
+            data = json.loads(raw)
+
+            # Secondary Pydantic validation (catches type mismatches and enum violations)
+            return ProductInfo.model_validate(data)
+
+        except ValidationError as e:
+            last_error = e
+            error_summary = "; ".join(
+                f"{err['loc']}: {err['msg']}" for err in e.errors()
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.choices[0].message.content,
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Validation failed (attempt {attempt + 1}): {error_summary}. "
+                        "Please fix the errors and return the complete corrected JSON."
+                    ),
+                }
+            )
+
+        except json.JSONDecodeError as e:
+            last_error = e
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Output was not valid JSON (attempt {attempt + 1}): {e}. "
+                        "Please output only a JSON object with no extra text."
+                    ),
+                }
+            )
+
+    raise RuntimeError(
+        f"Failed to get valid output after {max_retries} attempts. Last error: {last_error}"
+    )
+
+
+# Option 2: Pydantic retry fallback for models without native schema enforcement
+def extract_with_pydantic_fallback(image_path: str, max_retries: int = 3) -> ProductInfo:
+    """Works with Claude 3.5 Sonnet and other models lacking native schema constraints."""
+    import anthropic
+
+    anthropic_client = anthropic.Anthropic()
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type_map = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+    media_type = media_type_map.get(suffix, "image/jpeg")
+
+    schema_str = json.dumps(ProductInfo.model_json_schema(), indent=2)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Extract product info from this image. Strictly follow this JSON Schema "
+                        f"and output only the JSON object:\n\n{schema_str}"
+                    ),
+                },
+            ],
+        }
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=512,
+            messages=messages,
+        )
+
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            data = json.loads(raw)
+            return ProductInfo.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Validation failed (attempt {attempt + 1}): {e}. "
+                        "Please fix and return the complete corrected JSON."
+                    ),
+                }
+            )
+
+    raise RuntimeError(f"Failed after {max_retries} attempts. Last error: {last_error}")
+
+
+if __name__ == "__main__":
+    result = extract_with_schema("product.jpg")
+    print(json.dumps(result.model_dump(), indent=2))
+```
+
+Expected output:
+
+```json
+{
+  "product_name": "Wireless Headphones Pro",
+  "sku": "WHP-PRO-2024",
+  "price": 149.99,
+  "currency": "USD",
+  "in_stock": true,
+  "category": "Electronics",
+  "discount_percent": 15.0
+}
+```
+
+## Gotchas
+
+**Gotcha 1: `additionalProperties: false` causes the model to omit fields**
+
+Setting `additionalProperties: false` in the schema prevents the model from adding unexpected fields, but the side effect is that when the model is unsure about a field value, it omits the field entirely instead of returning `null` — causing Pydantic validation to fail on required fields.
+
+Fix: make uncertain fields `Optional` with a default of `None`. It's better to get `null` back than a missing field.
+
+```python
+# Avoid: required field that the model may silently omit
+discount_percent: float
+
+# Prefer: optional field that returns null when uncertain
+discount_percent: Optional[float] = None
+```
+
+**Gotcha 2: Enum fields return "close but not exact" values**
+
+Models sometimes return `"usd"` instead of `"USD"`, or `"pounds"` instead of `"GBP"`. `Literal` type validation fails immediately. Fix: normalize before validation, and explicitly list valid enum values in your retry prompt.
+
+```python
+def normalize_currency(raw: dict) -> dict:
+    aliases = {"RMB": "CNY", "rmb": "CNY", "usd": "USD", "eur": "EUR", "gbp": "GBP"}
+    if "currency" in raw and isinstance(raw["currency"], str):
+        upper = raw["currency"].upper()
+        raw["currency"] = aliases.get(raw["currency"], upper)
+    return raw
+```
+
+**Gotcha 3: Nested required fields get omitted when data is ambiguous**
+
+When image content is unclear, models tend to omit required fields inside nested objects rather than setting the entire nested object to `null`. For example, the `address` object is present but `city` inside it is missing.
+
+Fix: make all nested fields `Optional` with a default of `None`, and instruct the model to return `null` rather than guess:
+
+```python
+class Address(BaseModel):
+    street: Optional[str] = None  # return null when uncertain, never guess
+    city: Optional[str] = None
+    postal_code: Optional[str] = None
+```

@@ -1,0 +1,313 @@
+---
+title: 强制 JSON Schema 输出
+description: 让 VLM 严格按照预定义 JSON Schema 返回数据，包含字段名、类型和必填字段的强校验，适用于输出对接数据库、API 或 TypeScript 类型的场景。
+category: structured-output
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要 VLM 返回严格符合预定义 JSON Schema 的数据——不仅仅是"合法 JSON"，而是要完全匹配指定的字段名、类型和必填字段约束。常见场景：
+
+- 输出直接写入数据库（字段名必须匹配列名）
+- 输出传给下游 API（有严格的请求体 schema）
+- 输出对接 TypeScript 类型（运行时校验失败会崩溃）
+
+相比"输出 JSON 就行"，这里需要的是**字段级别的类型安全**。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 原生支持 `response_format` + JSON Schema，强制校验，首选 |
+| **Claude 3.5 Sonnet** | 无原生 schema 约束，但配合 Pydantic 重试效果好 |
+| **Gemini 1.5 Pro** | 支持 `response_schema`，适合长文档场景 |
+
+对精度要求高的生产场景优先用 GPT-4o Structured Outputs；其他模型加 Pydantic 兜底重试。
+
+## Prompt 模板
+
+```text
+你是一个结构化数据提取专家。从图片中提取信息，严格按照以下 JSON Schema 返回，不要输出任何多余文字。
+
+Schema 规则：
+- 所有必填字段必须存在
+- 字段值类型必须严格匹配（数字不要用字符串，枚举值必须完全一致）
+- 图片中找不到的可选字段返回 null
+
+不要包装在 markdown 代码块中，直接输出 JSON 对象。
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Literal
+from openai import OpenAI
+from pydantic import BaseModel, ValidationError
+
+client = OpenAI()
+
+
+# 定义 Pydantic 模型（同时用于校验和生成 JSON Schema）
+class ProductInfo(BaseModel):
+    product_name: str
+    sku: str
+    price: float
+    currency: Literal["CNY", "USD", "EUR", "GBP"]
+    in_stock: bool
+    category: Optional[str] = None
+    discount_percent: Optional[float] = None
+
+
+# 从 Pydantic 模型生成 OpenAI 兼容的 JSON Schema
+def build_json_schema(model: type[BaseModel]) -> dict:
+    schema = model.model_json_schema()
+    # OpenAI Structured Outputs 要求 additionalProperties: false
+    # 但注意：设置为 false 时模型会省略它不确定的字段
+    # 生产建议：用 null 替代缺失，而不是完全禁止额外字段
+    schema["additionalProperties"] = False
+    return schema
+
+
+def extract_with_schema(
+    image_path: str,
+    max_retries: int = 3,
+) -> ProductInfo:
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    schema = build_json_schema(ProductInfo)
+
+    messages = [
+        {
+            "role": "system",
+            "content": "你是结构化数据提取助手，严格按 JSON Schema 输出。",
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_data}"},
+                },
+                {
+                    "type": "text",
+                    "text": "从图片中提取商品信息，严格按照 schema 返回 JSON，不要多余文字。",
+                },
+            ],
+        },
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            # 方案一：使用 OpenAI Structured Outputs（GPT-4o 原生支持）
+            response = client.chat.completions.create(
+                model="gpt-4o-2024-08-06",  # Structured Outputs 需要此版本或更新
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ProductInfo",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+                messages=messages,
+                max_tokens=512,
+            )
+
+            raw = response.choices[0].message.content
+            data = json.loads(raw)
+
+            # 用 Pydantic 二次校验（捕获类型不匹配等问题）
+            return ProductInfo.model_validate(data)
+
+        except ValidationError as e:
+            last_error = e
+            # 把校验错误反馈给模型，让它修正
+            error_summary = "; ".join(
+                f"{err['loc']}: {err['msg']}" for err in e.errors()
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": response.choices[0].message.content,
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"输出校验失败（第 {attempt + 1} 次）：{error_summary}。"
+                        "请修正后重新输出完整 JSON。"
+                    ),
+                }
+            )
+
+        except json.JSONDecodeError as e:
+            last_error = e
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"输出不是合法 JSON（第 {attempt + 1} 次）：{e}。请只输出 JSON 对象。",
+                }
+            )
+
+    raise RuntimeError(
+        f"经过 {max_retries} 次重试仍无法获得合法输出。最后错误：{last_error}"
+    )
+
+
+# 方案二：Claude / Gemini 等不支持原生 schema 约束的模型
+def extract_with_pydantic_fallback(image_path: str, max_retries: int = 3) -> ProductInfo:
+    """适用于 Claude 3.5 Sonnet 等模型的 Pydantic 重试方案。"""
+    import anthropic
+
+    anthropic_client = anthropic.Anthropic()
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type_map = {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+    media_type = media_type_map.get(suffix, "image/jpeg")
+
+    schema_str = json.dumps(ProductInfo.model_json_schema(), ensure_ascii=False, indent=2)
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_data,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"从图片中提取商品信息，严格按照以下 JSON Schema 返回，只输出 JSON 对象：\n\n{schema_str}"
+                    ),
+                },
+            ],
+        }
+    ]
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=512,
+            messages=messages,
+        )
+
+        raw = response.content[0].text.strip()
+        # 去掉可能的 markdown 代码块
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        try:
+            data = json.loads(raw)
+            return ProductInfo.model_validate(data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"校验失败（第 {attempt + 1} 次）：{e}。请修正后重新输出完整 JSON。",
+                }
+            )
+
+    raise RuntimeError(f"经过 {max_retries} 次重试仍失败。最后错误：{last_error}")
+
+
+if __name__ == "__main__":
+    # 测试 GPT-4o 方案
+    result = extract_with_schema("product.jpg")
+    print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
+```
+
+预期输出：
+
+```json
+{
+  "product_name": "无线蓝牙耳机 Pro",
+  "sku": "WBH-PRO-2024",
+  "price": 299.0,
+  "currency": "CNY",
+  "in_stock": true,
+  "category": "电子产品",
+  "discount_percent": 15.0
+}
+```
+
+## 踩坑记录
+
+**坑 1：`additionalProperties: false` 导致模型省略字段**
+
+在 JSON Schema 中设置 `additionalProperties: false` 是为了防止模型输出多余字段，但副作用是：模型对某些字段不确定时会直接省略，而非返回 `null`，导致 Pydantic 校验失败。
+
+解决方案：把不确定的字段设为 `Optional` + 默认 `None`，宁可让模型返回 `null` 也不要省略。
+
+```python
+# 不推荐：必填但模型可能省略
+discount_percent: float
+
+# 推荐：可选字段，不确定时返回 null
+discount_percent: Optional[float] = None
+```
+
+**坑 2：枚举字段值"接近但不完全匹配"**
+
+模型有时会返回 `"cny"` 而不是 `"CNY"`，或者 `"RMB"` 而不是 `"CNY"`。Literal 类型校验会直接失败。
+
+解决方案：在重试 prompt 中明确列出合法枚举值，或在校验前做一次标准化：
+
+```python
+def normalize_currency(raw: dict) -> dict:
+    aliases = {"RMB": "CNY", "¥": "CNY", "$": "USD", "€": "EUR", "£": "GBP"}
+    if "currency" in raw and raw["currency"] in aliases:
+        raw["currency"] = aliases[raw["currency"]]
+    # 统一转大写
+    if "currency" in raw and isinstance(raw["currency"], str):
+        raw["currency"] = raw["currency"].upper()
+    return raw
+```
+
+**坑 3：嵌套必填字段被省略**
+
+当图片中的信息模糊时，模型倾向于省略嵌套对象内的必填字段，而不是把整个嵌套对象设为 `null`。例如地址对象里的 `city` 字段缺失，但 `address` 对象本身还在。
+
+解决方案：将嵌套必填字段改为可选，同时在 prompt 中明确说明"宁可返回 null 也不要猜测"：
+
+```python
+class Address(BaseModel):
+    street: Optional[str] = None  # 不确定时返回 null
+    city: Optional[str] = None
+    postal_code: Optional[str] = None
+```

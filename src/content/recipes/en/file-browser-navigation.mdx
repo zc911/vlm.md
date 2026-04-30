@@ -1,0 +1,287 @@
+---
+title: Automate File Browser Navigation
+description: Have an agent navigate Windows Explorer, macOS Finder, or a Linux file manager to locate files and perform move, rename, or delete operations based on the visual window state.
+category: computer-use
+lang: en
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent needs to complete file management tasks inside a GUI file browser:
+
+- Locate a specific file or folder
+- Rename a file
+- Move a file from one directory to another
+- Delete temporary files
+
+Unlike calling `os.rename()` or `shutil.move()` directly, this scenario applies when the agent can only interact through the screen — for example, a remote desktop session or an environment without code execution rights. The agent must read the current path and visible file list from the screenshot, then act through clicks, double-clicks, and context menus.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **Claude 3.5 Sonnet** | Reliable recognition of file browser UI elements (address bar, file list, side panel) |
+| **GPT-4o** | Better cross-platform generalization (Windows / macOS / Linux) |
+
+Both models work well here. If you need cross-platform coverage, GPT-4o generalizes more consistently.
+
+## Prompt Template
+
+```text
+You are a computer-use agent operating a file browser.
+
+Analyze the file browser window in the screenshot and return ONLY valid JSON:
+
+{
+  "platform": "windows" | "macos" | "linux" | "unknown",
+  "current_path": "path shown in the address bar, e.g. /Users/alice/Documents",
+  "visible_items": [
+    {"name": "file or folder name", "type": "file" | "folder", "is_selected": true or false}
+  ],
+  "target_visible": true or false,
+  "target_item": "name of the target item if visible, else null",
+  "needs_scroll": true or false,
+  "needs_show_hidden": false,
+  "next_action": {
+    "type": "double_click" | "right_click" | "click" | "type" | "key" | "scroll" | "wait" | "done" | "ask_human",
+    "target": "description of the target",
+    "coordinate": [x, y],
+    "text": "text to type (if type)",
+    "key": "key name (if key)",
+    "reason": "why this action"
+  }
+}
+
+Task goal: {goal}
+```
+
+## Code
+
+```python
+import base64
+import io
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import mss
+import pyautogui
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI()
+
+
+def take_screenshot() -> str:
+    """Capture the primary monitor and return a base64-encoded PNG string."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def open_file_browser(path: str = None) -> None:
+    """Open the system file browser, optionally at a specific path."""
+    if sys.platform == "darwin":
+        cmd = ["open", path or str(Path.home())]
+    elif sys.platform == "win32":
+        cmd = ["explorer", path or "C:\\"]
+    else:
+        for fm in ("nautilus", "thunar", "nemo", "dolphin"):
+            try:
+                subprocess.Popen([fm, path or str(Path.home())])
+                time.sleep(1.5)
+                return
+            except FileNotFoundError:
+                continue
+        raise RuntimeError("No supported file manager found")
+    subprocess.Popen(cmd)
+    time.sleep(1.5)
+
+
+SYSTEM_PROMPT = """You are a computer-use agent operating a file browser.
+Analyze the screenshot and return ONLY valid JSON with your action decision. No prose."""
+
+
+def analyze_and_decide(screenshot_b64: str, goal: str, history: list[dict]) -> dict:
+    """Call the VLM to analyze the file browser state and decide the next action."""
+    history_text = "\n".join(
+        f"Step {i+1}: {json.dumps(h)}" for i, h in enumerate(history)
+    )
+
+    prompt = f"""Analyze the file browser screenshot and return ONLY valid JSON:
+
+{{
+  "platform": "windows" | "macos" | "linux" | "unknown",
+  "current_path": "path in address bar",
+  "visible_items": [{{"name": "name", "type": "file|folder", "is_selected": false}}],
+  "target_visible": true or false,
+  "needs_scroll": true or false,
+  "needs_show_hidden": false,
+  "next_action": {{
+    "type": "double_click|right_click|click|type|key|scroll|wait|done|ask_human",
+    "target": "target description",
+    "coordinate": [x, y],
+    "text": "text to type if applicable",
+    "key": "key name if applicable",
+    "reason": "why this action"
+  }}
+}}
+
+Task goal: {goal}
+
+Action history so far:
+{history_text if history else "(none)"}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def execute_file_action(action: dict) -> str:
+    """Execute a file browser action. Returns a description string."""
+    t = action.get("type")
+    coord = action.get("coordinate")
+
+    if t == "double_click" and coord:
+        pyautogui.doubleClick(coord[0], coord[1])
+        return f"Double-clicked ({coord[0]}, {coord[1]})"
+
+    elif t == "right_click" and coord:
+        pyautogui.rightClick(coord[0], coord[1])
+        time.sleep(0.3)
+        return f"Right-clicked ({coord[0]}, {coord[1]})"
+
+    elif t == "click" and coord:
+        pyautogui.click(coord[0], coord[1])
+        return f"Clicked ({coord[0]}, {coord[1]})"
+
+    elif t == "type":
+        pyautogui.typewrite(action["text"], interval=0.05)
+        return f"Typed: {action['text']!r}"
+
+    elif t == "key":
+        pyautogui.press(action["key"])
+        return f"Pressed: {action['key']}"
+
+    elif t == "scroll":
+        direction = action.get("direction", "down")
+        clicks = action.get("clicks", 5)
+        if coord:
+            pyautogui.scroll(clicks if direction == "up" else -clicks, x=coord[0], y=coord[1])
+        else:
+            pyautogui.scroll(clicks if direction == "up" else -clicks)
+        return f"Scrolled {direction}"
+
+    elif t == "wait":
+        duration = action.get("duration", 1)
+        time.sleep(duration)
+        return f"Waited {duration}s"
+
+    elif t == "done":
+        return "DONE"
+
+    elif t == "ask_human":
+        print(f"\n[Human input needed] {action.get('reason')}")
+        input("Resolve the situation and press Enter to continue...")
+        return "Human intervention complete"
+
+    return f"Unknown action type: {t}"
+
+
+def navigate_file_browser(goal: str, start_path: str = None, max_steps: int = 25) -> None:
+    """
+    Open a file browser and run the agent loop to complete a navigation task.
+
+    Args:
+        goal: Task description, e.g. "Find report.pdf in ~/Downloads and rename it to report_final.pdf"
+        start_path: Starting directory path. None opens the default location.
+        max_steps: Maximum number of actions before giving up.
+    """
+    print(f"Goal: {goal}")
+    open_file_browser(start_path)
+
+    history: list[dict] = []
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- Step {step} ---")
+
+        screenshot = take_screenshot()
+        result = analyze_and_decide(screenshot, goal, history)
+
+        print(f"Current path:   {result.get('current_path')}")
+        print(f"Target visible: {result.get('target_visible')} | Needs scroll: {result.get('needs_scroll')}")
+
+        next_action = result.get("next_action", {})
+        print(f"Next action:    {next_action.get('type')} — {next_action.get('reason')}")
+
+        if next_action.get("type") == "done":
+            print("\nTask complete!")
+            break
+
+        desc = execute_file_action(next_action)
+        history.append({"step": step, "action": next_action, "desc": desc})
+        time.sleep(0.6)
+    else:
+        print(f"\nReached max steps ({max_steps}). Task not complete.")
+
+
+if __name__ == "__main__":
+    navigate_file_browser(
+        goal="Find the file named 'report.pdf' in the Downloads folder and move it to the Documents folder",
+        start_path=str(Path.home() / "Downloads"),
+    )
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## Gotchas
+
+**Gotcha 1: File sort order affects which files are visible — agent must scroll**
+
+File browsers default to sorting by name, but users may have switched to sort by date modified, size, or type. If the target file is in the middle or bottom of a large directory, it won't appear in the default view. An agent that doesn't scroll will report "file not found" when the file is simply off-screen.
+
+Fix: include a `needs_scroll` field in the VLM response. If `needs_scroll` is `true`, execute a scroll action before re-analyzing. Alternatively, teach the agent to use the browser's built-in search (Cmd+F on macOS, Ctrl+F on Windows) to jump directly to the file instead of relying on visual scanning.
+
+**Gotcha 2: Hidden files are off by default — agent won't find dotfiles**
+
+macOS and Linux config files are typically dotfiles (`.bashrc`, `.env`, `.ssh/`), and Windows has its own hidden system files. File browsers hide these by default. An agent looking for `.env` will conclude the file doesn't exist unless hidden files are shown first.
+
+Fix: add a `needs_show_hidden` field to the VLM response. If the target file starts with `.` or is explicitly a config file, the VLM should set this to `true`. The agent must toggle "show hidden files" before proceeding — macOS: Cmd+Shift+., Windows: View → Hidden items checkbox, Linux: Ctrl+H (most file managers).
+
+**Gotcha 3: Network drives and symlinks look identical to regular folders**
+
+Shared network directories (SMB, NFS) and symbolic links appear nearly identical to regular folders in both Finder and Explorer — only subtle icon differences distinguish them. Moving a file "into" a network drive folder triggers a cross-network transfer that is slow and may fail partway through. Deleting a symlink removes only the link, not the original file, so the agent may incorrectly think the task failed because the file still appears at its original location.
+
+Fix: for destructive operations (move, delete, rename), instruct the VLM to flag whether the target might be a network drive or symlink. If uncertain, `recommended_action` should be `"ask_human"` rather than proceeding automatically.

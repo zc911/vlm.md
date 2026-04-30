@@ -1,0 +1,309 @@
+---
+title: 表单字段检测与自动填写
+description: 让 agent 截图识别表单中的所有字段（标签、类型、位置），然后根据提供的数据自动填写，适用于注册、结账、问卷等动态表单。
+category: ui-grounding
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 遇到一个表单页面（注册、结账、问卷调查），但表单结构未知，字段数量和类型因页面不同而变化。你需要：
+
+1. **检测**：识别所有字段的标签、输入类型（文本框、下拉框、复选框、单选框）和屏幕位置
+2. **映射**：将字段标签与待填数据匹配
+3. **填写**：按坐标定位后模拟键入或点击
+
+这类任务在以下场景中特别有用：
+
+- 自动填写不同平台的求职申请表
+- 电商 agent 在结账页面填写收货地址
+- 测试 agent 批量填写回归测试所需的表单数据
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 综合识别能力最强，对复杂多列表单效果好 |
+| **Claude 3.5 Sonnet** | 对字段类型的判断更准确，尤其是区分单选/复选 |
+
+## Prompt 模板
+
+```text
+你是一个表单分析专家。请分析截图中的表单，提取所有可见的输入字段信息。
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{
+  "form_title": "表单标题（如有）",
+  "current_step": "当前步骤描述（如有，例如'第 2 步，共 3 步'）",
+  "fields": [
+    {
+      "label": "字段标签文本",
+      "type": "text|email|password|number|tel|textarea|select|checkbox|radio|date|file",
+      "required": true,
+      "placeholder": "占位符文本（如有）",
+      "current_value": "当前已填内容（如有）",
+      "options": ["选项1", "选项2"],
+      "center": {"x": 0.0, "y": 0.0},
+      "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}
+    }
+  ],
+  "submit_button": {
+    "label": "按钮文字",
+    "center": {"x": 0.0, "y": 0.0}
+  }
+}
+
+说明：
+- 所有坐标均为归一化值（0.0 到 1.0）
+- required 通过标签旁的星号(*)或"必填"字样判断
+- select 的 options 只填写当前可见的选项（下拉未展开时可为空数组）
+- radio/checkbox 的 options 填写所有可见选项
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import pyautogui
+from openai import OpenAI
+from PIL import Image
+import mss
+
+client = OpenAI()
+
+
+def take_screenshot(save_path: str = "/tmp/form_screen.png") -> tuple[str, int, int]:
+    """截取全屏，返回 (路径, 宽, 高)"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, shot.width, shot.height
+
+
+def detect_form_fields(image_path: str) -> dict:
+    """调用 VLM 检测表单字段结构"""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = """你是一个表单分析专家。请分析截图中的表单，提取所有可见的输入字段信息。
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{
+  "form_title": "表单标题（如有）",
+  "current_step": "当前步骤描述（如有）",
+  "fields": [
+    {
+      "label": "字段标签文本",
+      "type": "text|email|password|number|tel|textarea|select|checkbox|radio|date|file",
+      "required": true,
+      "placeholder": "占位符文本（如有）",
+      "current_value": "当前已填内容（如有）",
+      "options": [],
+      "center": {"x": 0.0, "y": 0.0},
+      "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}
+    }
+  ],
+  "submit_button": {
+    "label": "按钮文字",
+    "center": {"x": 0.0, "y": 0.0}
+  }
+}
+
+所有坐标均为归一化值（0.0 到 1.0）。required 通过星号(*)或"必填"判断。"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "你是表单分析助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def fill_field(field: dict, value: Any, screen_w: int, screen_h: int) -> None:
+    """根据字段类型执行对应的填写操作"""
+    cx = int(field["center"]["x"] * screen_w)
+    cy = int(field["center"]["y"] * screen_h)
+    field_type = field["type"]
+
+    pyautogui.moveTo(cx, cy, duration=0.2)
+
+    if field_type in ("text", "email", "password", "number", "tel", "textarea"):
+        pyautogui.click()
+        time.sleep(0.1)
+        # 清空已有内容
+        pyautogui.hotkey("ctrl", "a")
+        pyautogui.typewrite(str(value), interval=0.05)
+
+    elif field_type == "select":
+        pyautogui.click()
+        time.sleep(0.4)  # 等待下拉展开
+        # 重新截图后再次定位选项（见坑 2 处理方式）
+        print(f"  [select] 下拉框已点击，需要二次定位选项 '{value}'")
+
+    elif field_type == "checkbox":
+        if value and field.get("current_value") != "checked":
+            pyautogui.click()
+        elif not value and field.get("current_value") == "checked":
+            pyautogui.click()
+
+    elif field_type == "radio":
+        # value 应为选项文本，需要找到对应选项的坐标
+        print(f"  [radio] 选择选项: {value}")
+        pyautogui.click()
+
+    time.sleep(0.15)
+
+
+def autofill_form(data: dict[str, Any]) -> bool:
+    """
+    完整的表单自动填写流程
+    data: 字段标签 -> 填写值 的映射，例如 {"姓名": "张三", "邮箱": "test@example.com"}
+    """
+    img_path, screen_w, screen_h = take_screenshot()
+    form_info = detect_form_fields(img_path)
+
+    print(f"表单标题: {form_info.get('form_title', '未知')}")
+    print(f"当前步骤: {form_info.get('current_step', '无')}")
+    print(f"检测到 {len(form_info.get('fields', []))} 个字段\n")
+
+    filled = 0
+    skipped = []
+
+    for field in form_info.get("fields", []):
+        label = field["label"]
+        required = field.get("required", False)
+
+        # 在 data 中查找匹配的值（模糊匹配标签）
+        matched_value = None
+        for key, val in data.items():
+            if key.lower() in label.lower() or label.lower() in key.lower():
+                matched_value = val
+                break
+
+        if matched_value is None:
+            if required:
+                print(f"  警告：必填字段 '{label}' 未提供数据")
+            skipped.append(label)
+            continue
+
+        print(f"  填写 '{label}' ({field['type']}): {matched_value}")
+        fill_field(field, matched_value, screen_w, screen_h)
+        filled += 1
+
+    print(f"\n已填写 {filled} 个字段，跳过 {len(skipped)} 个: {skipped}")
+    return len(skipped) == 0
+
+
+if __name__ == "__main__":
+    # 示例数据
+    form_data = {
+        "姓名": "张三",
+        "邮箱": "zhangsan@example.com",
+        "手机": "13800138000",
+        "密码": "SecurePass123",
+        "城市": "上海",
+        "同意条款": True,
+    }
+
+    success = autofill_form(form_data)
+    print("表单填写完成" if success else "部分字段未填写，请检查")
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pyautogui pillow
+```
+
+## 踩坑记录
+
+**坑 1：模型经常漏掉必填字段的星号标识**
+
+带星号的必填字段（`姓名 *`）偶尔会被模型识别为 `required: false`，尤其是星号颜色浅或字体小时。保险做法是在 prompt 中强调，并在代码层面补充兜底：
+
+```python
+# 如果某字段提交后报错，大概率是必填字段被漏掉
+# 可以在 prompt 中增加一句：
+# "特别注意：标签旁有红色星号(*)、灰色星号或'必填'字样的字段，required 必须为 true"
+```
+
+**坑 2：下拉框选项在点击前不可见**
+
+`select` 类型的字段，点击后才展开选项列表，模型第一次检测时 `options` 数组是空的。需要在点击后重新截图再定位选项：
+
+```python
+def select_dropdown_option(field: dict, option_text: str, screen_w: int, screen_h: int) -> bool:
+    """点击下拉框后重新截图，定位并点击目标选项"""
+    cx = int(field["center"]["x"] * screen_w)
+    cy = int(field["center"]["y"] * screen_h)
+
+    # 第一次点击展开下拉
+    pyautogui.click(cx, cy)
+    time.sleep(0.5)
+
+    # 重新截图
+    img_path, w, h = take_screenshot("/tmp/dropdown.png")
+
+    # 让 VLM 在展开后的截图中找到目标选项
+    from your_module import locate_element
+    result = locate_element(img_path, f"下拉列表中的选项文字 '{option_text}'")
+    if result.get("found"):
+        px = int(result["center"]["x"] * w)
+        py = int(result["center"]["y"] * h)
+        pyautogui.click(px, py)
+        return True
+    return False
+```
+
+**坑 3：多步骤表单需要追踪当前步骤**
+
+注册流程往往有 3–4 步，每步字段不同。提交后页面跳转，agent 需要意识到进入了下一步，而不是认为任务完成：
+
+```python
+def fill_multistep_form(steps_data: list[dict]) -> bool:
+    """
+    steps_data: 每步的填写数据列表
+    每次提交后重新截图，检测是否出现新的表单页
+    """
+    for step_index, step_data in enumerate(steps_data):
+        print(f"\n=== 第 {step_index + 1} 步 ===")
+        autofill_form(step_data)
+
+        # 点击"下一步"或"提交"按钮
+        img_path, w, h = take_screenshot()
+        form_info = detect_form_fields(img_path)
+        if form_info.get("submit_button"):
+            btn = form_info["submit_button"]
+            bx = int(btn["center"]["x"] * w)
+            by = int(btn["center"]["y"] * h)
+            pyautogui.click(bx, by)
+            time.sleep(1.0)  # 等待页面跳转
+
+    return True
+```

@@ -1,0 +1,310 @@
+---
+title: Detect and Auto-fill Form Fields
+description: Have your agent screenshot a form, extract all field labels and types as structured data, then fill them based on provided values — works on registration, checkout, and survey forms where the structure is unknown in advance.
+category: ui-grounding
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent lands on a form page — registration, checkout, survey — but the form structure is unknown and varies across sites. You need to:
+
+1. **Detect**: identify every field's label, input type (text, dropdown, checkbox, radio), and screen position
+2. **Map**: match field labels to the values you want to fill in
+3. **Fill**: click or type at each field's coordinates
+
+Common use cases:
+
+- Auto-filling job application forms across different platforms
+- An e-commerce agent filling in a shipping address at checkout
+- A testing agent populating regression test forms with fixture data
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Strongest overall; handles multi-column and complex layouts well |
+| **Claude 3.5 Sonnet** | More accurate field-type classification, especially radio vs. checkbox |
+
+## Prompt Template
+
+```text
+You are a form analysis expert. Analyze the form in the screenshot and extract all visible input fields.
+
+Return strictly JSON with no other text:
+{
+  "form_title": "form title if visible",
+  "current_step": "current step description if multi-step (e.g. 'Step 2 of 3')",
+  "fields": [
+    {
+      "label": "field label text",
+      "type": "text|email|password|number|tel|textarea|select|checkbox|radio|date|file",
+      "required": true,
+      "placeholder": "placeholder text if present",
+      "current_value": "already-filled value if any",
+      "options": ["option1", "option2"],
+      "center": {"x": 0.0, "y": 0.0},
+      "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}
+    }
+  ],
+  "submit_button": {
+    "label": "button label",
+    "center": {"x": 0.0, "y": 0.0}
+  }
+}
+
+Notes:
+- All coordinates are normalized (0.0 to 1.0) relative to image width/height
+- Determine required from an asterisk (*) next to the label or "required" text
+- For select, options may be empty if the dropdown is collapsed
+- For radio/checkbox, list all visible options
+```
+
+## Code
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+import mss
+import pyautogui
+from openai import OpenAI
+from PIL import Image
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are a form analysis assistant. Output JSON only."
+
+
+def take_screenshot(save_path: str = "/tmp/form_screen.png") -> tuple[str, int, int]:
+    """Capture primary monitor; return (path, width, height)."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, shot.width, shot.height
+
+
+def detect_form_fields(image_path: str) -> dict:
+    """Call the VLM to extract the form structure from a screenshot."""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = """You are a form analysis expert. Analyze the form in the screenshot and extract all visible input fields.
+
+Return strictly JSON with no other text:
+{
+  "form_title": "form title if visible",
+  "current_step": "current step description if multi-step",
+  "fields": [
+    {
+      "label": "field label text",
+      "type": "text|email|password|number|tel|textarea|select|checkbox|radio|date|file",
+      "required": true,
+      "placeholder": "placeholder text if present",
+      "current_value": "already-filled value if any",
+      "options": [],
+      "center": {"x": 0.0, "y": 0.0},
+      "bbox": {"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}
+    }
+  ],
+  "submit_button": {"label": "button label", "center": {"x": 0.0, "y": 0.0}}
+}
+
+All coordinates normalized 0.0–1.0. Determine required from asterisk (*) or 'required' label text."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def fill_field(field: dict, value: Any, screen_w: int, screen_h: int) -> None:
+    """Perform the appropriate input action for a detected field."""
+    cx = int(field["center"]["x"] * screen_w)
+    cy = int(field["center"]["y"] * screen_h)
+    field_type = field["type"]
+
+    pyautogui.moveTo(cx, cy, duration=0.2)
+
+    if field_type in ("text", "email", "password", "number", "tel", "textarea"):
+        pyautogui.click()
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "a")  # select all existing content
+        pyautogui.typewrite(str(value), interval=0.05)
+
+    elif field_type == "select":
+        pyautogui.click()
+        time.sleep(0.4)  # wait for dropdown to expand
+        # Re-screenshot and locate the option — see Gotcha 2
+        print(f"  [select] dropdown opened, need second-pass to locate option '{value}'")
+
+    elif field_type == "checkbox":
+        current = field.get("current_value", "")
+        is_checked = current in ("checked", "true", True)
+        if value and not is_checked:
+            pyautogui.click()
+        elif not value and is_checked:
+            pyautogui.click()
+
+    elif field_type == "radio":
+        print(f"  [radio] selecting option: {value}")
+        pyautogui.click()
+
+    time.sleep(0.15)
+
+
+def autofill_form(data: dict[str, Any]) -> bool:
+    """
+    Full form auto-fill pipeline.
+    data: label -> value mapping, e.g. {"First Name": "Alice", "Email": "alice@example.com"}
+    Returns True if all required fields were filled.
+    """
+    img_path, screen_w, screen_h = take_screenshot()
+    form_info = detect_form_fields(img_path)
+
+    print(f"Form title: {form_info.get('form_title', 'unknown')}")
+    print(f"Current step: {form_info.get('current_step', 'none')}")
+    print(f"Detected {len(form_info.get('fields', []))} fields\n")
+
+    filled = 0
+    skipped = []
+
+    for field in form_info.get("fields", []):
+        label = field["label"]
+        required = field.get("required", False)
+
+        # Fuzzy label matching
+        matched_value = None
+        for key, val in data.items():
+            if key.lower() in label.lower() or label.lower() in key.lower():
+                matched_value = val
+                break
+
+        if matched_value is None:
+            if required:
+                print(f"  WARNING: required field '{label}' has no data")
+            skipped.append(label)
+            continue
+
+        print(f"  Filling '{label}' ({field['type']}): {matched_value}")
+        fill_field(field, matched_value, screen_w, screen_h)
+        filled += 1
+
+    print(f"\nFilled {filled} fields, skipped {len(skipped)}: {skipped}")
+    return len(skipped) == 0
+
+
+if __name__ == "__main__":
+    form_data = {
+        "First Name": "Alice",
+        "Last Name": "Smith",
+        "Email": "alice@example.com",
+        "Phone": "+1-555-0100",
+        "Password": "Secur3P@ss",
+        "City": "San Francisco",
+        "Agree to terms": True,
+    }
+
+    success = autofill_form(form_data)
+    print("Form filled successfully" if success else "Some fields were skipped")
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pyautogui pillow
+```
+
+## Gotchas
+
+**Gotcha 1: Model misses the required asterisk**
+
+Fields marked with a small or light-colored asterisk (`*`) are sometimes returned with `required: false`. Add an explicit reminder to the prompt and never trust the model's `required` flag alone — validate by checking whether the page shows an error after submission:
+
+```python
+# Add to your prompt for better accuracy:
+# "Pay close attention: any label with a red asterisk (*), gray asterisk,
+#  or the word 'required' MUST have required set to true."
+```
+
+**Gotcha 2: Dropdown options are only visible after clicking**
+
+On the first pass, `select` fields have an empty `options` array because the list is hidden. After clicking to expand, take a second screenshot and ask the VLM to find your target option:
+
+```python
+def select_dropdown_option(
+    field: dict, option_text: str, screen_w: int, screen_h: int
+) -> bool:
+    """Click to open a dropdown, then re-screenshot to locate and click the option."""
+    cx = int(field["center"]["x"] * screen_w)
+    cy = int(field["center"]["y"] * screen_h)
+
+    pyautogui.click(cx, cy)
+    time.sleep(0.5)  # wait for animation
+
+    img_path, w, h = take_screenshot("/tmp/dropdown_open.png")
+    image_data = base64.b64encode(Path(img_path).read_bytes()).decode()
+
+    # Reuse locate_element to find the visible option text
+    from your_module import locate_element
+    result = locate_element(img_path, f"dropdown list item with text '{option_text}'")
+    if result.get("found"):
+        px = int(result["center"]["x"] * w)
+        py = int(result["center"]["y"] * h)
+        pyautogui.click(px, py)
+        return True
+    return False
+```
+
+**Gotcha 3: Multi-step forms — track which step you're on**
+
+Registration flows typically have 3–4 steps. After submitting one step, the agent must recognize it has advanced to the next step rather than assuming the task is done. Use the `current_step` field from the detection output:
+
+```python
+def fill_multistep_form(steps_data: list[dict]) -> bool:
+    """
+    steps_data: one dict of field values per step.
+    After each submit, re-detect the form to confirm progression.
+    """
+    for step_index, step_data in enumerate(steps_data):
+        print(f"\n=== Step {step_index + 1} ===")
+        autofill_form(step_data)
+
+        # Click the submit/next button
+        img_path, w, h = take_screenshot()
+        form_info = detect_form_fields(img_path)
+        if form_info.get("submit_button"):
+            btn = form_info["submit_button"]
+            bx = int(btn["center"]["x"] * w)
+            by = int(btn["center"]["y"] * h)
+            pyautogui.click(bx, by)
+            time.sleep(1.2)  # wait for page transition
+
+    return True
+```

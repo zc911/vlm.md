@@ -1,0 +1,288 @@
+---
+title: 带置信度的结构化输出
+description: 在低质量图片（模糊扫描、光线不足）上提取结构化数据时，让模型对每个字段单独报告置信度，系统据此自动标记需要人工审核的字段。
+category: structured-output
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要从低质量图片（模糊扫描件、手机拍照光线差、老旧文件褪色）中提取结构化数据。问题在于：某些字段可能无法准确识别，如果模型静默地返回错误值，下游系统会接收错误数据而完全不知情。
+
+解决方案是让模型对**每个字段**单独报告置信度分数（0.0–1.0），系统根据阈值自动将低置信度字段路由到人工审核队列。
+
+这一模式在以下场景尤其有价值：
+- 保险理赔单据识别（错误代价高）
+- 历史档案数字化（图像质量普遍较低）
+- 医疗表单 OCR（字段缺失或错误不可接受）
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 置信度估计最准确，视觉理解强，首选 |
+| **Claude 3.5 Sonnet** | 结构化输出格式更稳定，置信度表述更谨慎 |
+
+两个模型都倾向于高估置信度，需要在已知低质量图片上标定阈值后再用于生产。
+
+## Prompt 模板
+
+```text
+你是一个文档信息提取专家。从图片中提取以下字段，并对每个字段给出置信度分数（0.0–1.0）。
+
+置信度定义：
+- 1.0：字段清晰可见，无歧义
+- 0.7–0.9：可见但有轻微模糊或不确定
+- 0.4–0.6：部分模糊或遮挡，存在猜测成分
+- 0.0–0.3：严重模糊、遮挡或无法识别
+
+返回格式（每个字段包含 value 和 confidence）：
+{
+  "fields": {
+    "<字段名>": {
+      "value": <提取的值，无法识别时为 null>,
+      "confidence": <0.0–1.0 的浮点数>
+    }
+  }
+}
+
+注意：
+- 不要为了看起来"有用"而虚报置信度
+- 如果真的看不清，confidence 应该低于 0.3，value 返回 null
+- 只输出 JSON，不要有任何多余文字
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Any
+from openai import OpenAI
+from pydantic import BaseModel, Field, field_validator
+
+client = OpenAI()
+
+
+class FieldResult(BaseModel):
+    value: Optional[Any] = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("confidence")
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+
+class ExtractionResult(BaseModel):
+    fields: dict[str, FieldResult]
+
+    def low_confidence_fields(self, threshold: float = 0.6) -> list[str]:
+        """返回置信度低于阈值的字段名列表。"""
+        return [
+            name
+            for name, result in self.fields.items()
+            if result.confidence < threshold
+        ]
+
+    def to_values(self) -> dict[str, Any]:
+        """只返回字段值（不含置信度），方便传给下游系统。"""
+        return {name: result.value for name, result in self.fields.items()}
+
+    def confidence_report(self) -> str:
+        """生成可读的置信度报告。"""
+        lines = ["字段置信度报告："]
+        for name, result in self.fields.items():
+            bar = "█" * int(result.confidence * 10) + "░" * (10 - int(result.confidence * 10))
+            flag = " ⚠ 需人工审核" if result.confidence < 0.6 else ""
+            lines.append(f"  {name:20s} [{bar}] {result.confidence:.2f}  值={result.value!r}{flag}")
+        return "\n".join(lines)
+
+
+def extract_with_confidence(
+    image_path: str,
+    field_names: list[str],
+    confidence_threshold: float = 0.6,
+    max_retries: int = 3,
+) -> tuple[ExtractionResult, list[str]]:
+    """
+    从图片中提取字段，附带每字段置信度。
+
+    返回：
+        (ExtractionResult, 需人工审核的字段列表)
+    """
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    fields_list = "\n".join(f"- {f}" for f in field_names)
+    prompt = f"""你是一个文档信息提取专家。从图片中提取以下字段，并对每个字段给出置信度分数（0.0–1.0）。
+
+需要提取的字段：
+{fields_list}
+
+置信度定义：
+- 1.0：字段清晰可见，无歧义
+- 0.7–0.9：可见但有轻微模糊或不确定
+- 0.4–0.6：部分模糊或遮挡，存在猜测成分
+- 0.0–0.3：严重模糊、遮挡或无法识别
+
+返回格式：
+{{
+  "fields": {{
+    "<字段名>": {{"value": <提取的值或null>, "confidence": <0.0–1.0>}}
+  }}
+}}
+
+注意：不要虚报置信度；看不清的字段 confidence 应低于 0.3，value 返回 null。
+只输出 JSON。"""
+
+    messages = [
+        {"role": "system", "content": "你是文档提取助手，诚实报告每个字段的置信度。"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+
+    from pydantic import ValidationError
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            response_format={"type": "json_object"},
+            messages=messages,
+            max_tokens=1024,
+        )
+
+        raw = response.choices[0].message.content
+
+        try:
+            data = json.loads(raw)
+            result = ExtractionResult.model_validate(data)
+            needs_review = result.low_confidence_fields(confidence_threshold)
+            return result, needs_review
+
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"输出校验失败（第 {attempt + 1} 次）：{e}。"
+                        "请确保每个字段都包含 value 和 confidence（0.0–1.0 的浮点数）。"
+                    ),
+                }
+            )
+
+    raise RuntimeError(f"经过 {max_retries} 次重试仍失败。最后错误：{last_error}")
+
+
+def route_for_review(
+    result: ExtractionResult,
+    needs_review: list[str],
+    record_id: str,
+) -> dict:
+    """将提取结果路由：高置信度字段自动通过，低置信度字段进入审核队列。"""
+    auto_approved = {
+        name: val
+        for name, val in result.to_values().items()
+        if name not in needs_review
+    }
+    pending_review = {
+        name: {
+            "value": result.fields[name].value,
+            "confidence": result.fields[name].confidence,
+        }
+        for name in needs_review
+    }
+
+    return {
+        "record_id": record_id,
+        "auto_approved": auto_approved,
+        "pending_review": pending_review,
+        "review_required": len(needs_review) > 0,
+    }
+
+
+if __name__ == "__main__":
+    field_names = [
+        "patient_name",
+        "date_of_birth",
+        "diagnosis_code",
+        "prescription_date",
+        "doctor_signature",
+    ]
+
+    result, needs_review = extract_with_confidence(
+        "medical_form_scan.jpg",
+        field_names=field_names,
+        confidence_threshold=0.6,
+    )
+
+    print(result.confidence_report())
+    print()
+
+    routed = route_for_review(result, needs_review, record_id="REC-001")
+    print(json.dumps(routed, ensure_ascii=False, indent=2))
+```
+
+预期输出（低质量扫描件场景）：
+
+```json
+{
+  "record_id": "REC-001",
+  "auto_approved": {
+    "patient_name": "张三",
+    "prescription_date": "2024-03-15"
+  },
+  "pending_review": {
+    "date_of_birth": {"value": "1985-??-12", "confidence": 0.45},
+    "diagnosis_code": {"value": null, "confidence": 0.2},
+    "doctor_signature": {"value": "模糊签名", "confidence": 0.35}
+  },
+  "review_required": true
+}
+```
+
+## 踩坑记录
+
+**坑 1：模型系统性高估置信度**
+
+VLM 对置信度的估计普遍偏高——一张明显模糊的图片，模型可能还是会给出 0.8 的置信度。这是因为模型更倾向于"显得有用"而不是"诚实报告不确定性"。
+
+解决方案：在已知低质量图片上测试，找到实际准确率对应的置信度分布，然后把阈值**提高**（比如把"需审核"阈值从 0.6 调到 0.75）。不要直接用模型给出的置信度作为绝对可信度。
+
+**坑 2："置信度"有两种含义，要明确区分**
+
+- **可读性置信度**：图片中这个字段的文字是否清晰（OCR 质量）
+- **语义置信度**：模型是否理解这个字段的含义（比如手写医疗缩写）
+
+两者可以独立变化：字迹清晰但模型不理解缩写 → 可读性高、语义置信度低。
+
+在 prompt 中明确说明你需要的是哪种置信度（通常是可读性置信度）：
+
+```text
+置信度仅反映图片中文字的清晰程度，不反映语义理解难度。
+```
+
+**坑 3：不要要求整体置信度，要逐字段**
+
+如果让模型给整体输出打一个置信度分数，它会取"平均值"，掩盖掉某几个关键字段严重不可靠的问题。
+
+逐字段置信度才有实际意义：系统可以精确知道哪些字段需要人工确认，哪些可以自动通过，而不是整批数据要么全通过要么全审核。

@@ -1,0 +1,291 @@
+---
+title: Detect and Handle Error Dialogs
+description: When an unexpected error dialog appears mid-task, have the agent classify it (recoverable vs fatal) and automatically dismiss, retry, or escalate to a human.
+category: computer-use
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent is mid-way through a multi-step task (batch file processing, form filling, etc.) when an unexpected error dialog appears. The agent must:
+
+1. **Detect** whether a dialog is present
+2. **Classify** it: recoverable (file not found, network timeout) vs fatal (permission denied, disk full)
+3. **Decide**: dismiss and continue, retry, or escalate to a human
+
+This recipe shows how a VLM handles all three steps and provides a reusable framework for the three most common dialog categories.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Accurate on diverse OS and application dialog styles |
+| **Claude 3.5 Sonnet** | More conservative classification; lower false-positive rate |
+
+Both models perform similarly here. Use whichever is already integrated in your project.
+
+## Prompt Template
+
+```text
+You are the error-handling module of a computer-use agent.
+
+Analyze the screenshot to determine if an error, warning, or confirmation dialog is present. Return ONLY valid JSON:
+
+{
+  "has_dialog": true or false,
+  "dialog_type": "error" | "warning" | "confirmation" | "security" | "info" | null,
+  "dialog_source": "os" | "app" | "browser" | "antivirus" | null,
+  "message_summary": "one-sentence summary of the dialog content (null if no dialog)",
+  "severity": "fatal" | "recoverable" | "info" | null,
+  "recommended_action": "dismiss" | "retry" | "ask_human" | "none",
+  "button_to_click": "label of the button to click (e.g. OK, Cancel, Retry), or null",
+  "reasoning": "1-2 sentences explaining your assessment"
+}
+
+Severity rules:
+- fatal: permission denied, disk full, system crash, driver error
+- recoverable: file not found, network timeout, temporary lock, format error
+- info: operation complete, software update notification
+
+Security rule: for ANY dialog where dialog_source is "antivirus" or dialog_type is "security",
+recommended_action MUST be "ask_human".
+```
+
+## Code
+
+```python
+import base64
+import io
+import json
+import time
+from enum import Enum
+
+import mss
+import pyautogui
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI()
+
+
+class DialogAction(str, Enum):
+    DISMISS = "dismiss"
+    RETRY = "retry"
+    ASK_HUMAN = "ask_human"
+    NONE = "none"
+
+
+DIALOG_PROMPT = """You are the error-handling module of a computer-use agent.
+
+Analyze the screenshot and return ONLY valid JSON:
+
+{
+  "has_dialog": true or false,
+  "dialog_type": "error" | "warning" | "confirmation" | "security" | "info" | null,
+  "dialog_source": "os" | "app" | "browser" | "antivirus" | null,
+  "message_summary": "one-sentence summary (null if no dialog)",
+  "severity": "fatal" | "recoverable" | "info" | null,
+  "recommended_action": "dismiss" | "retry" | "ask_human" | "none",
+  "button_to_click": "button label to click, or null",
+  "reasoning": "1-2 sentences"
+}
+
+Security rule: if dialog_source is "antivirus" OR dialog_type is "security",
+recommended_action MUST be "ask_human". No exceptions."""
+
+
+def take_screenshot() -> str:
+    """Capture the primary monitor and return a base64-encoded PNG string."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def analyze_dialog(screenshot_b64: str) -> dict:
+    """Ask the VLM to analyze any dialog present in the screenshot."""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "You are a dialog analysis assistant. Output JSON only."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": DIALOG_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=512,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def find_button_coordinate(screenshot_b64: str, button_text: str) -> tuple[int, int] | None:
+    """Locate a button by label text and return its center coordinates."""
+    prompt = f"""Find the button labeled "{button_text}" in the screenshot.
+Return its center pixel coordinates as JSON: {{"x": <int>, "y": <int>}}
+If the button is not visible, return {{"x": null, "y": null}}.
+Output JSON only."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        max_tokens=128,
+    )
+    result = json.loads(response.choices[0].message.content)
+    x, y = result.get("x"), result.get("y")
+    if x is not None and y is not None:
+        return (int(x), int(y))
+    return None
+
+
+def handle_dialog(
+    analysis: dict,
+    screenshot_b64: str,
+    on_ask_human=None,
+    max_retries: int = 3,
+    retry_count: int = 0,
+) -> str:
+    """Act on the VLM's dialog analysis. Returns a status string."""
+    if not analysis.get("has_dialog"):
+        return "no_dialog"
+
+    action = analysis.get("recommended_action", DialogAction.NONE)
+    summary = analysis.get("message_summary", "Unknown error")
+    severity = analysis.get("severity")
+    button_text = analysis.get("button_to_click")
+
+    print(f"Dialog detected: {summary}")
+    print(f"Severity: {severity} | Action: {action}")
+
+    # Security dialogs always go to human — enforce in code too
+    if analysis.get("dialog_source") == "antivirus" or analysis.get("dialog_type") == "security":
+        action = DialogAction.ASK_HUMAN
+
+    if action == DialogAction.ASK_HUMAN:
+        msg = f"[Human required] {summary}\nSource: {analysis.get('dialog_source')}"
+        if on_ask_human:
+            on_ask_human(msg, analysis)
+        else:
+            print(msg)
+            input("Resolve the dialog and press Enter to continue...")
+        return "human_handled"
+
+    if action == DialogAction.DISMISS and button_text:
+        coord = find_button_coordinate(screenshot_b64, button_text)
+        if coord:
+            pyautogui.click(coord[0], coord[1])
+            time.sleep(0.5)
+            return "dismissed"
+        # Fall back to Escape if button not found
+        pyautogui.press("escape")
+        time.sleep(0.5)
+        return "dismissed_via_escape"
+
+    if action == DialogAction.RETRY:
+        if retry_count >= max_retries:
+            print(f"Exhausted {max_retries} retries. Escalating to human.")
+            if on_ask_human:
+                on_ask_human(f"Retry failed: {summary}", analysis)
+            return "retry_exhausted"
+        backoff = 2 ** retry_count
+        print(f"Retrying in {backoff}s (attempt {retry_count + 1}/{max_retries})...")
+        time.sleep(backoff)
+        return "retry"
+
+    return "no_action"
+
+
+def check_and_handle_dialog(on_ask_human=None, retry_count: int = 0) -> str:
+    """Take a screenshot, analyze dialogs, and handle them. Returns status string."""
+    screenshot = take_screenshot()
+    analysis = analyze_dialog(screenshot)
+    return handle_dialog(
+        analysis,
+        screenshot,
+        on_ask_human=on_ask_human,
+        retry_count=retry_count,
+    )
+
+
+def agent_step_with_dialog_handling(step_fn, on_ask_human=None):
+    """Wrap an agent step with automatic dialog detection and handling."""
+    retry_count = 0
+    while True:
+        result = check_and_handle_dialog(on_ask_human=on_ask_human, retry_count=retry_count)
+
+        if result == "no_dialog":
+            step_fn()
+            return
+        elif result in ("dismissed", "dismissed_via_escape", "human_handled"):
+            time.sleep(0.5)
+            continue
+        elif result == "retry":
+            retry_count += 1
+            step_fn()
+        elif result == "retry_exhausted":
+            raise RuntimeError("Task aborted after repeated retries.")
+
+
+if __name__ == "__main__":
+    def dummy_step():
+        print("Executing task step...")
+
+    def human_handler(msg, analysis):
+        print(f"\n{'='*50}\n{msg}\n{'='*50}")
+        input("Press Enter after resolving...")
+
+    agent_step_with_dialog_handling(dummy_step, on_ask_human=human_handler)
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## Gotchas
+
+**Gotcha 1: OS-level dialogs and app-level dialogs require different handling**
+
+Windows UAC prompts and macOS permission dialogs are system-level — they have fixed styles and often require administrator confirmation that `pyautogui` cannot provide directly. Application dialogs vary wildly in appearance. The VLM must distinguish between them.
+
+Add a `dialog_source` field (`"os"`, `"app"`, `"browser"`, `"antivirus"`) to the VLM response and branch your handling logic accordingly. OS-level dialogs may require elevated privileges or a subprocess call rather than a simple click.
+
+**Gotcha 2: "Save changes?" dialogs require domain knowledge to answer safely**
+
+When a document close triggers "Save changes? Yes / No / Cancel", the correct answer depends entirely on task context. Clicking "Don't Save" in the wrong situation causes permanent data loss.
+
+These dialogs should always be classified as `dialog_type: "confirmation"` and default to `recommended_action: "ask_human"` — unless the task instructions explicitly specified whether to save. Hard-code this rule in the prompt and validate it in your handler before acting.
+
+**Gotcha 3: Antivirus and security prompts must always escalate**
+
+Security dialogs from Windows Defender, SmartScreen, macOS Gatekeeper, or antivirus software can look nearly identical to ordinary confirmation dialogs. Automatically clicking "Allow" or "Run anyway" can introduce security vulnerabilities.
+
+Enforce this in two places: (1) the prompt must instruct the VLM that security/antivirus dialogs always map to `ask_human`, and (2) the code must re-check the `dialog_source` and `dialog_type` fields and override any other recommendation to `ask_human` before acting. Never trust the VLM alone on security decisions.

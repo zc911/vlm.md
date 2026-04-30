@@ -1,0 +1,284 @@
+---
+title: 嵌套结构数据提取
+description: 从包含层级结构的图片（组织架构图、嵌套表格、多层级表单、树形图）中提取完整的嵌套 JSON，保留层级关系。
+category: structured-output
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: advanced
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+图片中包含层级结构信息，agent 需要将其提取为保留层级关系的嵌套 JSON。典型场景：
+
+- **组织架构图**：CEO &rarr; VP &rarr; Director &rarr; Manager 多级汇报关系
+- **嵌套表格**：主表头下有子表头，行合并表示分组
+- **多层级表单**：Section &rarr; SubSection &rarr; Field 三级结构
+- **树形图/思维导图**：节点有任意深度的子节点
+
+挑战：模型需要同时理解视觉位置关系（缩进、连线、合并单元格）和语义层级关系。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 最强的视觉-语义联合理解，处理复杂组织架构图首选 |
+| **Claude 3.5 Sonnet** | 对嵌套 JSON 格式输出更稳定，层级深时误差更小 |
+
+复杂嵌套结构（&gt;3 层）建议用 GPT-4o；输出格式稳定性要求高时用 Claude 3.5 Sonnet。
+
+## Prompt 模板
+
+**方案 A：直接输出嵌套 JSON（适合层级 &lt;= 3 层）**
+
+```text
+请从图片中提取层级结构数据，以嵌套 JSON 格式返回。最大嵌套深度为 3 层。
+
+每个节点的结构：
+{
+  "id": "唯一标识符（字母+数字）",
+  "name": "节点名称",
+  "attributes": {},  // 节点附带的其他属性（职位、部门等）
+  "children": []     // 子节点列表，叶节点为空数组
+}
+
+如果层级超过 3 层，请将第 3 层以下的内容平铺合并到第 3 层节点的 attributes 中。
+只输出 JSON，不要有任何多余文字。
+```
+
+**方案 B：扁平化 + parent_id（适合任意深度，推荐用于组织架构）**
+
+```text
+请从图片中提取层级结构数据，以扁平 JSON 数组返回（每个节点一条记录，通过 parent_id 表示层级）。
+
+每条记录的结构：
+{
+  "id": "节点唯一 ID（如 node_1, node_2）",
+  "name": "节点名称",
+  "parent_id": "父节点 ID，根节点为 null",
+  "level": 层级深度（根节点为 0）,
+  "attributes": {}  // 职位、部门、人数等附加信息
+}
+
+返回格式：{"nodes": [...]}
+只输出 JSON，不要有任何多余文字。
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Any
+from openai import OpenAI
+from pydantic import BaseModel
+
+client = OpenAI()
+
+
+# 方案 B：扁平化节点模型（推荐用于任意深度结构）
+class FlatNode(BaseModel):
+    id: str
+    name: str
+    parent_id: Optional[str] = None
+    level: int
+    attributes: dict[str, Any] = {}
+
+
+class FlatTree(BaseModel):
+    nodes: list[FlatNode]
+
+
+def extract_nested_structure(
+    image_path: str,
+    strategy: str = "flat",  # "flat" 或 "nested"
+    max_retries: int = 3,
+) -> FlatTree | dict:
+    """
+    从图片中提取嵌套层级结构。
+
+    strategy="flat"   : 扁平化 + parent_id，适合任意深度
+    strategy="nested" : 直接嵌套 JSON，适合层级 <= 3
+    """
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    if strategy == "flat":
+        prompt = """请从图片中提取层级结构数据，以扁平 JSON 数组返回（每个节点一条记录，通过 parent_id 表示层级）。
+
+每条记录的结构：
+{
+  "id": "节点唯一 ID（如 node_1, node_2）",
+  "name": "节点名称",
+  "parent_id": "父节点 ID，根节点为 null",
+  "level": 层级深度（根节点为 0）,
+  "attributes": {}
+}
+
+返回格式：{"nodes": [...]}
+只输出 JSON，不要有任何多余文字。"""
+    else:
+        prompt = """请从图片中提取层级结构数据，以嵌套 JSON 格式返回。最大嵌套深度为 3 层。
+
+每个节点：{"id": "唯一ID", "name": "名称", "attributes": {}, "children": [子节点]}
+
+如果层级超过 3 层，将深层内容合并到第 3 层节点的 attributes 中。
+只输出 JSON，不要有任何多余文字。"""
+
+    messages = [
+        {"role": "system", "content": "你是层级结构数据提取专家，严格按 JSON 格式输出。"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+
+    from pydantic import ValidationError
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            response_format={"type": "json_object"},
+            messages=messages,
+            max_tokens=2048,
+        )
+
+        raw = response.choices[0].message.content
+
+        try:
+            data = json.loads(raw)
+
+            if strategy == "flat":
+                return FlatTree.model_validate(data)
+            else:
+                return data  # 嵌套结构直接返回 dict
+
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"输出校验失败（第 {attempt + 1} 次）：{e}。"
+                        "请修正后重新输出完整 JSON。注意 parent_id 必须指向已存在的节点 id，根节点的 parent_id 为 null。"
+                    ),
+                }
+            )
+
+    raise RuntimeError(f"经过 {max_retries} 次重试仍失败。最后错误：{last_error}")
+
+
+def tree_to_nested(flat: FlatTree) -> dict:
+    """将扁平化节点列表转换为嵌套树形结构（用于展示）。"""
+    node_map = {n.id: {**n.model_dump(), "children": []} for n in flat.nodes}
+    root = None
+
+    for node in flat.nodes:
+        if node.parent_id is None:
+            root = node_map[node.id]
+        else:
+            parent = node_map.get(node.parent_id)
+            if parent:
+                parent["children"].append(node_map[node.id])
+
+    return root or {}
+
+
+def validate_tree_integrity(flat: FlatTree) -> list[str]:
+    """校验扁平化树的完整性，返回错误列表。"""
+    errors = []
+    ids = {n.id for n in flat.nodes}
+
+    for node in flat.nodes:
+        if node.parent_id and node.parent_id not in ids:
+            errors.append(f"节点 {node.id} 的 parent_id={node.parent_id} 不存在")
+
+    roots = [n for n in flat.nodes if n.parent_id is None]
+    if len(roots) == 0:
+        errors.append("没有根节点（parent_id=null 的节点）")
+    elif len(roots) > 1:
+        errors.append(f"存在多个根节点：{[r.id for r in roots]}")
+
+    return errors
+
+
+if __name__ == "__main__":
+    result = extract_nested_structure("org_chart.png", strategy="flat")
+
+    # 校验树完整性
+    errors = validate_tree_integrity(result)
+    if errors:
+        print("树结构校验警告：")
+        for err in errors:
+            print(f"  - {err}")
+
+    # 转换为嵌套结构展示
+    nested = tree_to_nested(result)
+    print(json.dumps(nested, ensure_ascii=False, indent=2))
+```
+
+扁平化输出示例（组织架构图）：
+
+```json
+{
+  "nodes": [
+    {"id": "node_1", "name": "张总（CEO）", "parent_id": null, "level": 0, "attributes": {"title": "CEO"}},
+    {"id": "node_2", "name": "李副总（CTO）", "parent_id": "node_1", "level": 1, "attributes": {"title": "CTO"}},
+    {"id": "node_3", "name": "王总监（研发）", "parent_id": "node_2", "level": 2, "attributes": {"title": "研发总监", "headcount": 20}},
+    {"id": "node_4", "name": "陈总监（测试）", "parent_id": "node_2", "level": 2, "attributes": {"title": "测试总监", "headcount": 8}},
+    {"id": "node_5", "name": "赵总监（产品）", "parent_id": "node_1", "level": 1, "attributes": {"title": "产品总监"}}
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：层级过深时模型混淆父子关系**
+
+当嵌套超过 3 层时，模型经常把第 4、5 层节点的父节点搞错，出现"跳级"或"平级变父级"的错误。
+
+解决方案：在 prompt 中明确限制最大深度为 3 层，超出部分平铺到 `attributes`；或使用扁平化方案（方案 B），用 `parent_id` 引用代替物理嵌套，模型出错率显著降低。
+
+```python
+# 在 prompt 中加入深度限制
+"如果层级超过 3 层，将第 3 层以下的内容合并到第 3 层节点的 attributes 中，不要继续嵌套。"
+```
+
+**坑 2：组织架构图等递归结构——改用 parent_id 扁平化**
+
+组织架构图的层级是任意深度的，直接让模型输出嵌套 JSON 会导致：层级越深、错误越多。
+
+更稳定的方案是让模型输出扁平 `nodes` 列表，每个节点只需记住自己的 `parent_id`，由代码在提取后重建树形结构。这样模型只需处理"局部关系"而不是"全局嵌套"。
+
+**坑 3：父子关系模糊时不要让模型猜测**
+
+图片中有时存在视觉歧义（节点间的连线不清晰、缩进不规则），模型会"猜"一个父节点。
+
+解决方案：在 prompt 中加入明确指示：
+
+```text
+如果某个节点的父节点不确定，将其 parent_id 设为 null，并在 attributes 中加入 "ambiguous_parent": true。
+不要猜测不确定的层级关系。
+```
+
+然后在代码中对带 `"ambiguous_parent": true` 的节点单独处理或人工审核：
+
+```python
+ambiguous = [n for n in result.nodes if n.attributes.get("ambiguous_parent")]
+if ambiguous:
+    print(f"需要人工确认的节点：{[n.name for n in ambiguous]}")
+```

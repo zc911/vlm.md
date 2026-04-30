@@ -1,0 +1,233 @@
+---
+title: Understand Screen State and Decide Next Action
+description: The core perceive-decide loop for computer-use agents — given a screenshot and action history, have a VLM determine app state, whether the last action succeeded, and what to do next.
+category: computer-use
+lang: en
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Every decision cycle of a computer-use agent must answer four questions:
+
+1. What application is currently open?
+2. What state is the UI in?
+3. Did the last action succeed?
+4. What should the next action be?
+
+This recipe implements a ReAct-style perceive → decide loop: take a screenshot → call a VLM with action history → receive `next_action` as JSON → execute → repeat.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **Claude 3.5 Sonnet (Computer Use)** | Native computer-use tool support; action schema works out of the box |
+| **GPT-4o** | Strong visual understanding; best for custom JSON action formats |
+
+Prefer Claude 3.5 Sonnet — it has higher accuracy identifying UI elements (buttons, inputs, menus) in screenshots.
+
+## Prompt Template
+
+```text
+You are a computer-use agent. You will receive:
+1. A screenshot of the current screen
+2. The history of actions taken so far
+
+Analyze the screenshot and return ONLY valid JSON:
+
+{
+  "app": "name of the currently active application",
+  "state": "one-sentence description of the current UI state",
+  "last_action_succeeded": true or false, or "unknown" if indeterminate,
+  "reasoning": "1-2 sentences explaining your assessment",
+  "next_action": {
+    "type": "click" | "type" | "key" | "scroll" | "wait" | "done" | "ask_human",
+    "target": "description of click target (if click)",
+    "coordinate": [x, y],  // only for click/scroll
+    "text": "text to type (if type)",
+    "key": "key name (if key, e.g. Return, Escape)",
+    "reason": "why this action"
+  }
+}
+
+Set type to "done" when the task is complete.
+Set type to "ask_human" for any situation requiring human judgment (e.g. security prompts).
+```
+
+## Code
+
+```python
+import base64
+import io
+import json
+import time
+
+import mss
+import pyautogui
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = """You are a computer-use agent. Given a screenshot and action history,
+analyze the screen and return ONLY valid JSON with keys:
+  app, state, last_action_succeeded, reasoning, next_action
+
+next_action.type must be one of:
+  click | type | key | scroll | wait | done | ask_human
+
+For click/scroll, provide coordinate: [x, y] in screen pixels.
+Output JSON only — no prose, no markdown fences."""
+
+
+def take_screenshot() -> str:
+    """Capture the primary monitor and return a base64-encoded PNG."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def ask_vlm(screenshot_b64: str, action_history: list[dict]) -> dict:
+    """Call the VLM to analyze screen state and decide the next action."""
+    if action_history:
+        history_text = "\n".join(
+            f"Step {i+1}: {json.dumps(a)}" for i, a in enumerate(action_history)
+        )
+        user_text = f"Action history:\n{history_text}\n\nAnalyze the screenshot and give the next action."
+    else:
+        user_text = "This is the initial screenshot. Analyze it and give the first action."
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def execute_action(action: dict) -> str:
+    """Execute the action decided by the VLM. Returns a description string."""
+    t = action.get("type")
+
+    if t == "click":
+        x, y = action["coordinate"]
+        pyautogui.click(x, y)
+        return f"Clicked ({x}, {y})"
+
+    elif t == "type":
+        pyautogui.typewrite(action["text"], interval=0.05)
+        return f"Typed: {action['text']!r}"
+
+    elif t == "key":
+        pyautogui.press(action["key"])
+        return f"Pressed key: {action['key']}"
+
+    elif t == "scroll":
+        x, y = action["coordinate"]
+        direction = action.get("direction", "down")
+        clicks = action.get("clicks", 3)
+        pyautogui.scroll(clicks if direction == "up" else -clicks, x=x, y=y)
+        return f"Scrolled {direction} at ({x}, {y})"
+
+    elif t == "wait":
+        duration = action.get("duration", 2)
+        time.sleep(duration)
+        return f"Waited {duration}s"
+
+    elif t == "done":
+        return "DONE"
+
+    elif t == "ask_human":
+        print(f"\n[Human input needed] {action.get('reason', 'No reason given')}")
+        input("Handle the situation and press Enter to continue...")
+        return "Human intervention complete"
+
+    else:
+        return f"Unknown action type: {t}"
+
+
+def run_agent(goal: str, max_steps: int = 20) -> None:
+    """Run the computer-use agent loop until done or max_steps reached."""
+    print(f"Goal: {goal}")
+    action_history: list[dict] = []
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- Step {step} ---")
+
+        # Perceive
+        screenshot = take_screenshot()
+
+        # Decide
+        result = ask_vlm(screenshot, action_history)
+        print(f"App:              {result.get('app')}")
+        print(f"State:            {result.get('state')}")
+        print(f"Last succeeded:   {result.get('last_action_succeeded')}")
+
+        next_action = result.get("next_action", {})
+        print(f"Next action:      {next_action.get('type')} — {next_action.get('reason')}")
+
+        if next_action.get("type") == "done":
+            print("\nTask complete!")
+            break
+
+        # Act
+        desc = execute_action(next_action)
+        action_history.append({"step": step, "action": next_action, "desc": desc})
+
+        # Give the UI time to respond
+        time.sleep(0.8)
+    else:
+        print(f"\nReached max steps ({max_steps}). Task not complete.")
+
+
+if __name__ == "__main__":
+    run_agent("Open a browser, search for 'python vlm tutorial', screenshot the results")
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## Gotchas
+
+**Gotcha 1: Loading spinners and UI transitions cause premature re-action**
+
+After a click, the application may take 0.5–3 seconds to respond. If the agent screenshots immediately, the VLM sees a spinner or blank page, may classify the action as failed, and repeats the click — triggering duplicate submissions or navigation.
+
+Fix: add a small fixed delay after every `execute_action` call (0.8 s in the example). More importantly, instruct the VLM explicitly: **if you see a loading indicator, you must output `{"type": "wait", "duration": 2}` — never act on an intermediate state.** The agent should re-screenshot after waiting, not assume the transition is complete.
+
+**Gotcha 2: Unexpected confirmation dialogs break the action plan**
+
+The agent plans to click "Save", but a "Overwrite existing file?" dialog has appeared on top. If the VLM doesn't detect it, it will try to click the original coordinates — now obscured — and the action silently fails.
+
+Fix: add an `"unexpected_dialog"` field to the VLM's JSON response. Before deciding `next_action`, the model must first check whether any modal or dialog is present that wasn't part of the plan. Handle the dialog before resuming the main task flow.
+
+**Gotcha 3: "Action appeared to succeed" is not the same as "action succeeded"**
+
+After clicking Submit, the page might look identical (same form, same button) whether the submission succeeded or failed. The VLM cannot distinguish these cases from appearance alone.
+
+Fix: for critical actions (submit, delete, save), wait 2–3 s after execution and look for explicit confirmation or error messages. Record the "expected state change" in the action history so the VLM can compare the before and after screenshots to verify.

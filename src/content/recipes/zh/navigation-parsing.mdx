@@ -1,0 +1,334 @@
+---
+title: 网页导航结构解析
+description: 让 agent 截图后提取网页的导航菜单结构（顶部导航、侧边栏、面包屑）为树形 JSON，帮助 agent 理解站点地图并规划后续导航步骤。
+category: ui-grounding
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 进入一个陌生网站，需要在执行具体任务前先"看懂"整个网站结构。通过 VLM 解析导航菜单，agent 可以：
+
+- 构建站点的树形地图，知道有哪些一级、二级页面
+- 判断当前所在的位置（高亮的菜单项、面包屑路径）
+- 规划最优的导航路径，减少不必要的页面跳转
+
+典型用例：
+
+- 信息采集 agent 需要先梳理栏目结构，再决定从哪里开始抓取
+- 测试 agent 遍历所有导航链接做冒烟测试
+- 用户任务 agent 寻找"账户设置"或"帮助中心"入口
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 整体识别能力最强，对英文/中文导航均表现稳定 |
+| **Claude 3.5 Sonnet** | 对多级嵌套菜单的层级关系理解更准确 |
+| **Gemini 1.5 Pro** | 大分辨率截图或需要低成本处理时的替代选项 |
+
+## Prompt 模板
+
+```text
+你是一个网页结构分析专家。请分析截图中的网页导航结构，提取所有可见的导航元素。
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{
+  "page_title": "当前页面标题",
+  "current_url_hint": "从面包屑或活跃菜单推断的当前页面路径",
+  "navigation": {
+    "top_nav": [
+      {
+        "label": "菜单项文字",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": [
+          {
+            "label": "子菜单项",
+            "active": false,
+            "center": {"x": 0.0, "y": 0.0}
+          }
+        ]
+      }
+    ],
+    "sidebar": [
+      {
+        "label": "侧边栏菜单项",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": []
+      }
+    ],
+    "breadcrumbs": ["首页", "产品", "详情页"]
+  }
+}
+
+说明：
+- 所有坐标均为归一化值（0.0 到 1.0）
+- active 表示当前页面对应的活跃菜单项（通常有高亮、下划线或不同背景色）
+- top_nav 不存在时返回空数组，sidebar 同理
+- breadcrumbs 按从左到右的顺序列出所有面包屑文字
+- 子菜单（二级菜单）只列出当前已展开可见的项
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+
+import mss
+from openai import OpenAI
+from PIL import Image
+
+client = OpenAI()
+
+
+def take_screenshot(save_path: str = "/tmp/nav_screen.png") -> tuple[str, int, int]:
+    """截取全屏，返回 (路径, 宽, 高)"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, shot.width, shot.height
+
+
+def parse_navigation(image_path: str) -> dict:
+    """调用 VLM 解析页面导航结构"""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = """你是一个网页结构分析专家。请分析截图中的网页导航结构，提取所有可见的导航元素。
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{
+  "page_title": "当前页面标题",
+  "current_url_hint": "从面包屑或活跃菜单推断的当前页面路径",
+  "navigation": {
+    "top_nav": [
+      {
+        "label": "菜单项文字",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": []
+      }
+    ],
+    "sidebar": [],
+    "breadcrumbs": []
+  }
+}
+
+所有坐标均为归一化值（0.0 到 1.0）。active 表示当前活跃的菜单项。"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "你是网页导航分析助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def print_nav_tree(nav_items: list, indent: int = 0) -> None:
+    """以树形格式打印导航结构"""
+    for item in nav_items:
+        prefix = "  " * indent + ("├─ " if indent > 0 else "")
+        active_mark = " [当前]" if item.get("active") else ""
+        print(f"{prefix}{item['label']}{active_mark}")
+        if item.get("children"):
+            print_nav_tree(item["children"], indent + 1)
+
+
+def find_nav_item(nav_items: list, label_keyword: str) -> dict | None:
+    """递归搜索导航树，找到匹配关键词的菜单项"""
+    for item in nav_items:
+        if label_keyword.lower() in item["label"].lower():
+            return item
+        if item.get("children"):
+            found = find_nav_item(item["children"], label_keyword)
+            if found:
+                return found
+    return None
+
+
+def navigate_to(page, target_label: str) -> bool:
+    """
+    解析导航结构后，找到目标菜单项并点击
+    page: Playwright Page 对象（可替换为 pyautogui 方案）
+    """
+    import io
+
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    screen_w, screen_h = img.size
+
+    tmp_path = "/tmp/nav_pw.png"
+    img.save(tmp_path)
+
+    nav_info = parse_navigation(tmp_path)
+    nav = nav_info.get("navigation", {})
+    all_items = nav.get("top_nav", []) + nav.get("sidebar", [])
+
+    target = find_nav_item(all_items, target_label)
+    if not target:
+        print(f"未找到导航项: {target_label}")
+        return False
+
+    pixel_x = int(target["center"]["x"] * screen_w)
+    pixel_y = int(target["center"]["y"] * screen_h)
+    print(f"点击导航项 '{target['label']}' at ({pixel_x}, {pixel_y})")
+    page.mouse.click(pixel_x, pixel_y)
+    return True
+
+
+if __name__ == "__main__":
+    img_path, w, h = take_screenshot()
+    nav_info = parse_navigation(img_path)
+
+    print(f"页面标题: {nav_info.get('page_title', '未知')}")
+    print(f"当前位置: {nav_info.get('current_url_hint', '未知')}")
+
+    breadcrumbs = nav_info["navigation"].get("breadcrumbs", [])
+    if breadcrumbs:
+        print(f"面包屑: {' > '.join(breadcrumbs)}")
+
+    print("\n顶部导航:")
+    print_nav_tree(nav_info["navigation"].get("top_nav", []))
+
+    if nav_info["navigation"].get("sidebar"):
+        print("\n侧边栏:")
+        print_nav_tree(nav_info["navigation"].get("sidebar", []))
+
+    # 保存导航结构为 JSON
+    with open("/tmp/nav_structure.json", "w", encoding="utf-8") as f:
+        json.dump(nav_info, f, ensure_ascii=False, indent=2)
+    print("\n导航结构已保存到 /tmp/nav_structure.json")
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pillow
+# 如需 Playwright 版
+pip install playwright && playwright install chromium
+```
+
+## 踩坑记录
+
+**坑 1：移动端截图中汉堡菜单是折叠状态**
+
+手机或窄屏截图中，顶部导航被收进汉堡菜单（三横线图标），VLM 只能看到图标，无法解析菜单项。需要先点击汉堡菜单展开，再截图解析：
+
+```python
+def expand_hamburger_menu(page) -> bool:
+    """尝试找到并点击汉堡菜单按钮"""
+    import io
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    img.save("/tmp/before_expand.png")
+
+    from your_module import locate_element
+    result = locate_element(
+        "/tmp/before_expand.png",
+        "汉堡菜单按钮（三条横线图标），通常在页面左上角或右上角"
+    )
+    if result.get("found"):
+        w, h = img.size
+        px = int(result["center"]["x"] * w)
+        py = int(result["center"]["y"] * h)
+        page.mouse.click(px, py)
+        page.wait_for_timeout(500)
+        return True
+    return False
+```
+
+**坑 2：大型下拉式导航（mega menu）需要 hover 才能展开**
+
+一些电商或门户网站的顶部导航在鼠标悬停时才展开二级菜单。静态截图里看不到子菜单项，VLM 只能返回一级菜单。可以先 hover 目标菜单项后再截图：
+
+```python
+def get_submenu_items(page, parent_label: str) -> list:
+    """
+    先 hover 一级菜单项，触发 mega menu 展开，
+    再截图让 VLM 解析二级菜单
+    """
+    import io
+
+    # 先解析当前导航，找到父菜单项
+    nav_info = parse_navigation_playwright(page)
+    nav = nav_info.get("navigation", {})
+    parent = find_nav_item(nav.get("top_nav", []), parent_label)
+    if not parent:
+        return []
+
+    screenshot = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot))
+    w, h = img.size
+
+    # Hover 父菜单项
+    px = int(parent["center"]["x"] * w)
+    py = int(parent["center"]["y"] * h)
+    page.mouse.move(px, py)
+    page.wait_for_timeout(600)  # 等待 hover 动画
+
+    # 重新截图解析（此时子菜单应已展开）
+    nav_info_expanded = parse_navigation_playwright(page)
+    expanded_parent = find_nav_item(
+        nav_info_expanded["navigation"].get("top_nav", []), parent_label
+    )
+    return expanded_parent.get("children", []) if expanded_parent else []
+```
+
+**坑 3：活跃菜单项帮助 agent 定位当前位置**
+
+`active: true` 的菜单项告诉 agent 它目前在哪个页面，这对多步骤导航任务非常重要。如果 agent 错误地认为自己已经到达目标页面，会跳过必要的点击步骤。建议在每次导航后验证：
+
+```python
+def verify_navigation_success(page, expected_label: str) -> bool:
+    """导航点击后验证是否到达了正确的页面"""
+    import io
+
+    page.wait_for_load_state("networkidle")
+    screenshot = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot))
+    img.save("/tmp/after_nav.png")
+
+    nav_info = parse_navigation("/tmp/after_nav.png")
+    nav = nav_info.get("navigation", {})
+    all_items = nav.get("top_nav", []) + nav.get("sidebar", [])
+
+    # 检查目标菜单项是否变为活跃状态
+    target = find_nav_item(all_items, expected_label)
+    if target and target.get("active"):
+        print(f"导航成功：当前在 '{target['label']}'")
+        return True
+
+    # 也可以通过面包屑验证
+    breadcrumbs = nav["navigation"].get("breadcrumbs", []) if "navigation" in nav else []
+    if any(expected_label.lower() in bc.lower() for bc in breadcrumbs):
+        return True
+
+    print(f"导航可能未成功，活跃菜单项不匹配 '{expected_label}'")
+    return False
+```

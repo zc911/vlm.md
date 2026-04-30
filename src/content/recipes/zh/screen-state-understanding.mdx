@@ -1,0 +1,233 @@
+---
+title: 屏幕状态理解与下一步决策
+description: Computer-use agent 的核心感知-决策循环：截图后让 VLM 判断当前应用状态、上一步是否成功，并输出下一步操作的 JSON。
+category: computer-use
+lang: zh
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+Computer-use agent 的每一个决策周期都包含四个问题：
+
+1. 当前打开的是哪个应用？
+2. 该应用处于什么状态？
+3. 上一步操作是否成功？
+4. 下一步应该执行什么操作？
+
+本 recipe 实现 ReAct 风格的「感知 → 决策」循环：截图 → 带操作历史调用 VLM → 获取 JSON 格式的 `next_action` → 执行 → 重复。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **Claude 3.5 Sonnet (Computer Use)** | 原生支持 computer-use 工具，动作 schema 开箱即用 |
+| **GPT-4o** | 视觉理解强，适合自定义 JSON 动作格式 |
+
+优先选 Claude 3.5 Sonnet，它对截图中的 UI 元素（按钮、输入框、菜单）识别精度更高。
+
+## Prompt 模板
+
+```text
+你是一个 computer-use agent。你会收到：
+1. 当前屏幕截图
+2. 到目前为止已执行的操作历史
+
+请分析截图，回答以下问题并以 JSON 返回：
+
+{
+  "app": "当前活动的应用名称",
+  "state": "对当前 UI 状态的简短描述（一句话）",
+  "last_action_succeeded": true 或 false，"unknown" 如果无法判断,
+  "reasoning": "你判断的依据（1-2句）",
+  "next_action": {
+    "type": "click" | "type" | "key" | "scroll" | "wait" | "done" | "ask_human",
+    "target": "点击目标的描述（如果是 click）",
+    "coordinate": [x, y],  // 仅在 click/scroll 时提供
+    "text": "要输入的文字（如果是 type）",
+    "key": "按键名（如果是 key，例如 Return、Escape）",
+    "reason": "为什么执行此操作"
+  }
+}
+
+如果任务已完成，type 设为 "done"。
+如果遇到需要人工决策的情况（如安全警告），type 设为 "ask_human"。
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+
+import pyautogui
+import mss
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = """你是一个 computer-use agent。你会收到当前屏幕截图和操作历史，
+分析截图后以 JSON 返回：app、state、last_action_succeeded、reasoning 和 next_action。
+
+next_action.type 只能是以下之一：
+  click | type | key | scroll | wait | done | ask_human
+
+点击时必须提供 coordinate: [x, y]（屏幕像素坐标）。
+只输出 JSON，不要有任何多余文字。"""
+
+
+def take_screenshot() -> str:
+    """截图并返回 base64 编码字符串。"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]  # 主显示器
+        shot = sct.grab(monitor)
+        # 转换为 PNG bytes
+        import io
+        from PIL import Image
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def ask_vlm(screenshot_b64: str, action_history: list[dict]) -> dict:
+    """调用 VLM 分析屏幕状态并返回下一步操作。"""
+    history_text = "\n".join(
+        f"步骤 {i+1}: {json.dumps(a, ensure_ascii=False)}"
+        for i, a in enumerate(action_history)
+    )
+    user_text = f"操作历史：\n{history_text}\n\n请分析当前截图并给出下一步操作。" if action_history else "这是初始屏幕截图，请分析并给出第一步操作。"
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def execute_action(action: dict) -> str:
+    """执行 VLM 决策的操作，返回操作描述。"""
+    t = action.get("type")
+
+    if t == "click":
+        x, y = action["coordinate"]
+        pyautogui.click(x, y)
+        return f"点击 ({x}, {y})"
+
+    elif t == "type":
+        pyautogui.typewrite(action["text"], interval=0.05)
+        return f"输入文字: {action['text']!r}"
+
+    elif t == "key":
+        pyautogui.press(action["key"])
+        return f"按键: {action['key']}"
+
+    elif t == "scroll":
+        x, y = action["coordinate"]
+        direction = action.get("direction", "down")
+        clicks = action.get("clicks", 3)
+        pyautogui.scroll(clicks if direction == "up" else -clicks, x=x, y=y)
+        return f"滚动 {direction} at ({x}, {y})"
+
+    elif t == "wait":
+        duration = action.get("duration", 2)
+        time.sleep(duration)
+        return f"等待 {duration}s"
+
+    elif t == "done":
+        return "DONE"
+
+    elif t == "ask_human":
+        print(f"\n[需要人工介入] {action.get('reason', '未知原因')}")
+        input("请处理后按 Enter 继续...")
+        return "人工介入完成"
+
+    else:
+        return f"未知操作类型: {t}"
+
+
+def run_agent(goal: str, max_steps: int = 20) -> None:
+    """运行 computer-use agent 循环直到任务完成或达到最大步数。"""
+    print(f"目标: {goal}")
+    action_history: list[dict] = []
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- 步骤 {step} ---")
+
+        # 感知：截图
+        screenshot = take_screenshot()
+
+        # 决策：调用 VLM
+        result = ask_vlm(screenshot, action_history)
+        print(f"应用: {result.get('app')}")
+        print(f"状态: {result.get('state')}")
+        print(f"上一步成功: {result.get('last_action_succeeded')}")
+
+        next_action = result.get("next_action", {})
+        print(f"下一步: {next_action.get('type')} — {next_action.get('reason')}")
+
+        # 检查是否完成
+        if next_action.get("type") == "done":
+            print("\n任务完成！")
+            break
+
+        # 执行操作
+        desc = execute_action(next_action)
+        action_history.append({"step": step, "action": next_action, "desc": desc})
+
+        # 等待 UI 响应
+        time.sleep(0.8)
+    else:
+        print(f"\n已达到最大步数 ({max_steps})，任务未完成。")
+
+
+if __name__ == "__main__":
+    run_agent("打开浏览器，搜索 'python vlm tutorial'，截图保存结果")
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## 踩坑记录
+
+**坑 1：加载中的过渡状态让 agent 误操作**
+
+点击按钮后，应用可能需要 0.5–3 秒才能响应。如果 agent 立刻截图，VLM 会看到加载spinner或空白页面，可能误判"操作失败"并重复点击。
+
+解决方案：在 `execute_action` 后加固定等待（0.8s），对于 `wait` 类型动作让 VLM 自己决定等待时长。VLM 看到 spinner 时应输出 `{"type": "wait", "duration": 2}` 而不是继续操作。在 prompt 中明确说明：**看到加载动画时，必须输出 wait 操作**。
+
+**坑 2：意外弹出的确认对话框打乱执行计划**
+
+agent 计划下一步点击"保存"，但屏幕上突然出现"是否覆盖已有文件？"的对话框。如果 VLM 没有识别到这个变化，会尝试点击原来的坐标（现在被对话框遮住了）。
+
+解决方案：在每次截图后先让 VLM 检查是否有**非预期的对话框或弹窗**，再决定下一步。可以在 prompt 中加一个字段 `"unexpected_dialog": true/false`。
+
+**坑 3：「操作看起来成功」≠「操作真的成功」**
+
+点击"提交"按钮后页面外观可能没有变化（按钮状态、表单内容相同），但后台实际上已经提交成功或失败了。VLM 无法区分这两种情况。
+
+解决方案：对于关键操作（提交、删除、保存），在操作后等待足够时间（2–3s）再截图，并检查是否出现成功提示或错误信息。在操作历史中记录「期望的状态变化」，让 VLM 对比截图验证。

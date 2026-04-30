@@ -1,0 +1,252 @@
+---
+title: Locate and Click Web UI Elements
+description: Have your agent screenshot a page, ask a VLM for the normalized coordinates of a target button or input, then click at those pixel coordinates with pyautogui or Playwright — reliable even when CSS selectors break.
+category: ui-grounding
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your web automation agent needs to interact with a dynamic page where CSS selectors are unreliable — React-rendered buttons with hash-based class names, elements inside iframes, or layouts that shift between builds.
+
+The solution: **screenshot → VLM localization → coordinate click**. The model "sees" the page and returns normalized coordinates (0–1 range) for the target element. You multiply by screen dimensions to get pixel coordinates, then drive the mouse.
+
+Typical use cases:
+
+- Automated testing when selectors are flaky
+- Browser agent clicking dynamically generated pagination links
+- RPA flows that must find a "Next Step" button in a form
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best coordinate accuracy; strong UI element recognition |
+| **Claude 3.5 Sonnet** | Better reasoning on complex or dense layouts; fewer false positives |
+
+Both accept base64-encoded images. Start with GPT-4o; switch to Claude for dense UIs.
+
+## Prompt Template
+
+```text
+You are a web UI analysis expert. Find the following target element in the screenshot and return its bounding box as normalized coordinates.
+
+Target element: {target_description}
+
+Return strictly JSON with no other text:
+{
+  "found": true,
+  "element_description": "brief description of the element you found",
+  "bbox": {
+    "x_min": 0.0,
+    "y_min": 0.0,
+    "x_max": 0.0,
+    "y_max": 0.0
+  },
+  "center": {
+    "x": 0.0,
+    "y": 0.0
+  }
+}
+
+Notes:
+- All coordinates are normalized (0.0 to 1.0) relative to image width/height
+- center is the midpoint of the bounding box
+- If the element is not visible, return {"found": false, "reason": "..."}
+```
+
+## Code
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+
+import mss
+import pyautogui
+from openai import OpenAI
+from PIL import Image
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are a UI element locator. Output JSON only."
+
+
+def take_screenshot(save_path: str = "/tmp/screen.png") -> tuple[str, int, int]:
+    """Capture the primary monitor and return (path, width, height)."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, shot.width, shot.height
+
+
+def locate_element(image_path: str, target_description: str) -> dict:
+    """Ask the VLM to locate a UI element; returns normalized coordinates."""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = f"""You are a web UI analysis expert. Find the following target element in the screenshot and return its bounding box as normalized coordinates.
+
+Target element: {target_description}
+
+Return strictly JSON with no other text:
+{{
+  "found": true,
+  "element_description": "brief description of the element you found",
+  "bbox": {{"x_min": 0.0, "y_min": 0.0, "x_max": 0.0, "y_max": 0.0}},
+  "center": {{"x": 0.0, "y": 0.0}}
+}}
+
+If the element is not visible, return {{"found": false, "reason": "..."}}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=256,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def click_element(target_description: str) -> bool:
+    """
+    Full pipeline: screenshot → VLM localize → convert coords → click.
+    Returns True on success.
+    """
+    # 1. Screenshot
+    img_path, screen_w, screen_h = take_screenshot()
+    print(f"Screen size: {screen_w}x{screen_h}")
+
+    # 2. VLM localization
+    result = locate_element(img_path, target_description)
+    print(f"VLM result: {json.dumps(result)}")
+
+    if not result.get("found"):
+        print(f"Element not found: {result.get('reason', 'unknown')}")
+        return False
+
+    # 3. Normalized → pixel coordinates
+    pixel_x = int(result["center"]["x"] * screen_w)
+    pixel_y = int(result["center"]["y"] * screen_h)
+    print(f"Clicking at: ({pixel_x}, {pixel_y})")
+
+    # 4. Click with a short human-like movement
+    pyautogui.moveTo(pixel_x, pixel_y, duration=0.3)
+    time.sleep(0.1)
+    pyautogui.click()
+    return True
+
+
+# --- Playwright version (recommended for headless browser agents) ---
+
+def click_element_playwright(page, target_description: str) -> bool:
+    """
+    Playwright-based version: screenshot the page, locate element, click.
+    page: a Playwright Page object
+    """
+    import io
+
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    screen_w, screen_h = img.size
+
+    tmp_path = "/tmp/pw_screen.png"
+    img.save(tmp_path)
+
+    result = locate_element(tmp_path, target_description)
+    if not result.get("found"):
+        return False
+
+    pixel_x = int(result["center"]["x"] * screen_w)
+    pixel_y = int(result["center"]["y"] * screen_h)
+    page.mouse.click(pixel_x, pixel_y)
+    return True
+
+
+if __name__ == "__main__":
+    success = click_element("blue 'Sign In' button, usually in the top-right corner")
+    print("Clicked successfully" if success else "Click failed")
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pyautogui pillow
+# For the Playwright variant
+pip install playwright && playwright install chromium
+```
+
+## Gotchas
+
+**Gotcha 1: Model returns ratios (0–1), not pixels — multiply by screen dimensions**
+
+This is the most common mistake. The model returns `"center": {"x": 0.75, "y": 0.12}` and you pass `0.75` directly to pyautogui, clicking near the top-left corner.
+
+Always do: `pixel_x = int(norm_x * screen_width)`. On Retina/HiDPI displays, mss returns physical pixels while pyautogui uses logical pixels — divide by the device pixel ratio:
+
+```python
+import subprocess
+
+def get_dpi_scale() -> float:
+    """Detect device pixel ratio on macOS."""
+    result = subprocess.run(
+        ["system_profiler", "SPDisplaysDataType", "-json"],
+        capture_output=True, text=True
+    )
+    return 2.0 if "Retina" in result.stdout else 1.0
+
+scale = get_dpi_scale()
+pixel_x = int(norm_x * screen_w / scale)
+pixel_y = int(norm_y * screen_h / scale)
+```
+
+**Gotcha 2: Overlapping elements and z-index**
+
+Cookie banners, chat widgets, and modal overlays sit on top of your target. The VLM sees the topmost layer — it may identify the overlay instead of the button underneath. Dismiss known overlays before taking the screenshot:
+
+```python
+# Playwright: close cookie banner if present
+try:
+    page.locator("[class*='cookie'], [id*='consent']").first.click(timeout=2000)
+    page.wait_for_timeout(500)
+except Exception:
+    pass  # not present, continue
+```
+
+**Gotcha 3: Element is off-screen — scroll first**
+
+If the model returns `"found": false` with a reason like "not visible" or "below the fold," the element exists but isn't in the viewport. Scroll down and retry:
+
+```python
+def scroll_until_found(page, target_description: str, max_scrolls: int = 5) -> dict:
+    for _ in range(max_scrolls):
+        img = Image.open(io.BytesIO(page.screenshot()))
+        img.save("/tmp/scroll_check.png")
+        result = locate_element("/tmp/scroll_check.png", target_description)
+        if result.get("found"):
+            return result
+        page.mouse.wheel(0, 600)
+        page.wait_for_timeout(400)
+    return {"found": False, "reason": "element not found after scrolling"}
+```

@@ -1,0 +1,335 @@
+---
+title: Parse Web Navigation Structure
+description: Have your agent screenshot a webpage and extract the navigation menu structure (top nav, sidebar, breadcrumbs) as a tree JSON, so the agent understands the site map and can plan subsequent navigation steps.
+category: ui-grounding
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+  - Gemini 1.5 Pro
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent lands on an unfamiliar website and needs to understand the site structure before carrying out a specific task. By parsing the navigation with a VLM, the agent can:
+
+- Build a tree map of the site's sections and sub-sections
+- Determine where it currently is (highlighted menu item, breadcrumb trail)
+- Plan the shortest navigation path to a target page
+
+Common use cases:
+
+- A data-collection agent surveys the site structure before deciding where to start scraping
+- A test agent enumerates all nav links for a smoke test
+- A user-task agent locates the "Account Settings" or "Help Center" entry point
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Strongest overall; consistent on both English and non-English navbars |
+| **Claude 3.5 Sonnet** | More accurate hierarchy inference on deeply nested menus |
+| **Gemini 1.5 Pro** | Good fallback for high-resolution screenshots or cost-sensitive pipelines |
+
+## Prompt Template
+
+```text
+You are a web page structure analyst. Analyze the navigation elements visible in the screenshot.
+
+Return strictly JSON with no other text:
+{
+  "page_title": "current page title",
+  "current_url_hint": "inferred current path from breadcrumbs or active menu",
+  "navigation": {
+    "top_nav": [
+      {
+        "label": "menu item text",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": [
+          {
+            "label": "sub-item text",
+            "active": false,
+            "center": {"x": 0.0, "y": 0.0}
+          }
+        ]
+      }
+    ],
+    "sidebar": [
+      {
+        "label": "sidebar item text",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": []
+      }
+    ],
+    "breadcrumbs": ["Home", "Products", "Detail"]
+  }
+}
+
+Notes:
+- All coordinates are normalized (0.0 to 1.0) relative to image width/height
+- active marks the item corresponding to the current page (highlighted, underlined, or different background)
+- Return empty arrays for top_nav or sidebar if they are not present
+- breadcrumbs lists items left-to-right
+- children only includes currently visible (expanded) sub-items
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+
+import mss
+from openai import OpenAI
+from PIL import Image
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are a web navigation analysis assistant. Output JSON only."
+
+
+def take_screenshot(save_path: str = "/tmp/nav_screen.png") -> tuple[str, int, int]:
+    """Capture primary monitor; return (path, width, height)."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, shot.width, shot.height
+
+
+def parse_navigation(image_path: str) -> dict:
+    """Call the VLM to extract navigation structure from a screenshot."""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = """You are a web page structure analyst. Analyze the navigation elements visible in the screenshot.
+
+Return strictly JSON with no other text:
+{
+  "page_title": "current page title",
+  "current_url_hint": "inferred current path from breadcrumbs or active menu",
+  "navigation": {
+    "top_nav": [
+      {
+        "label": "menu item text",
+        "active": false,
+        "center": {"x": 0.0, "y": 0.0},
+        "children": []
+      }
+    ],
+    "sidebar": [],
+    "breadcrumbs": []
+  }
+}
+
+All coordinates normalized 0.0–1.0. active marks the current page's menu item."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def print_nav_tree(nav_items: list, indent: int = 0) -> None:
+    """Pretty-print a navigation tree."""
+    for item in nav_items:
+        prefix = "  " * indent + ("├─ " if indent > 0 else "")
+        active_mark = " [current]" if item.get("active") else ""
+        print(f"{prefix}{item['label']}{active_mark}")
+        if item.get("children"):
+            print_nav_tree(item["children"], indent + 1)
+
+
+def find_nav_item(nav_items: list, label_keyword: str) -> dict | None:
+    """Recursively search the nav tree for a label containing the keyword."""
+    for item in nav_items:
+        if label_keyword.lower() in item["label"].lower():
+            return item
+        if item.get("children"):
+            found = find_nav_item(item["children"], label_keyword)
+            if found:
+                return found
+    return None
+
+
+def navigate_to(page, target_label: str) -> bool:
+    """
+    Parse navigation, find the target item, and click it.
+    page: a Playwright Page object.
+    """
+    import io
+
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    screen_w, screen_h = img.size
+
+    tmp_path = "/tmp/nav_pw.png"
+    img.save(tmp_path)
+
+    nav_info = parse_navigation(tmp_path)
+    nav = nav_info.get("navigation", {})
+    all_items = nav.get("top_nav", []) + nav.get("sidebar", [])
+
+    target = find_nav_item(all_items, target_label)
+    if not target:
+        print(f"Navigation item not found: {target_label}")
+        return False
+
+    pixel_x = int(target["center"]["x"] * screen_w)
+    pixel_y = int(target["center"]["y"] * screen_h)
+    print(f"Clicking nav item '{target['label']}' at ({pixel_x}, {pixel_y})")
+    page.mouse.click(pixel_x, pixel_y)
+    return True
+
+
+if __name__ == "__main__":
+    img_path, w, h = take_screenshot()
+    nav_info = parse_navigation(img_path)
+
+    print(f"Page title: {nav_info.get('page_title', 'unknown')}")
+    print(f"Current location: {nav_info.get('current_url_hint', 'unknown')}")
+
+    breadcrumbs = nav_info["navigation"].get("breadcrumbs", [])
+    if breadcrumbs:
+        print(f"Breadcrumbs: {' > '.join(breadcrumbs)}")
+
+    print("\nTop navigation:")
+    print_nav_tree(nav_info["navigation"].get("top_nav", []))
+
+    if nav_info["navigation"].get("sidebar"):
+        print("\nSidebar:")
+        print_nav_tree(nav_info["navigation"].get("sidebar", []))
+
+    with open("/tmp/nav_structure.json", "w") as f:
+        json.dump(nav_info, f, indent=2)
+    print("\nNavigation structure saved to /tmp/nav_structure.json")
+```
+
+Install dependencies:
+
+```bash
+pip install openai mss pillow
+# For the Playwright variant
+pip install playwright && playwright install chromium
+```
+
+## Gotchas
+
+**Gotcha 1: Hamburger menus are collapsed on mobile screenshots**
+
+On narrow-viewport or mobile screenshots, the top nav is hidden behind a hamburger icon (three horizontal lines). The VLM can only see the icon, not the menu items. Click the hamburger button first, then re-screenshot:
+
+```python
+def expand_hamburger_menu(page) -> bool:
+    """Find and click the hamburger menu button if present."""
+    import io
+    from your_module import locate_element
+
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    img.save("/tmp/before_expand.png")
+
+    result = locate_element(
+        "/tmp/before_expand.png",
+        "hamburger menu button (three horizontal lines icon), usually top-left or top-right"
+    )
+    if result.get("found"):
+        w, h = img.size
+        px = int(result["center"]["x"] * w)
+        py = int(result["center"]["y"] * h)
+        page.mouse.click(px, py)
+        page.wait_for_timeout(500)
+        return True
+    return False
+```
+
+**Gotcha 2: Mega-menus require hover to reveal sub-items**
+
+Many e-commerce and portal sites only show the second level on mouse hover. A static screenshot captures only the top-level items. Hover over the parent item before taking the screenshot used for sub-menu parsing:
+
+```python
+def get_submenu_items(page, parent_label: str) -> list:
+    """
+    Hover over a top-nav item to trigger the mega-menu,
+    then re-screenshot and parse the revealed sub-items.
+    """
+    import io
+
+    screenshot = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot))
+    w, h = img.size
+    img.save("/tmp/before_hover.png")
+
+    nav_info = parse_navigation("/tmp/before_hover.png")
+    parent = find_nav_item(nav_info["navigation"].get("top_nav", []), parent_label)
+    if not parent:
+        return []
+
+    # Hover the parent item
+    px = int(parent["center"]["x"] * w)
+    py = int(parent["center"]["y"] * h)
+    page.mouse.move(px, py)
+    page.wait_for_timeout(600)  # wait for hover animation
+
+    # Re-screenshot with sub-menu expanded
+    nav_expanded = parse_navigation_from_page(page)
+    expanded_parent = find_nav_item(
+        nav_expanded["navigation"].get("top_nav", []), parent_label
+    )
+    return expanded_parent.get("children", []) if expanded_parent else []
+```
+
+**Gotcha 3: Use the active indicator to confirm where you are**
+
+The `active: true` flag tells the agent which page it is currently on — critical for multi-step navigation tasks. If the agent wrongly assumes it has already arrived at the target page, it skips necessary clicks. Always verify after navigating:
+
+```python
+def verify_navigation_success(page, expected_label: str) -> bool:
+    """Confirm the agent landed on the correct page after a nav click."""
+    import io
+
+    page.wait_for_load_state("networkidle")
+    screenshot = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot))
+    img.save("/tmp/after_nav.png")
+
+    nav_info = parse_navigation("/tmp/after_nav.png")
+    nav = nav_info.get("navigation", {})
+    all_items = nav.get("top_nav", []) + nav.get("sidebar", [])
+
+    # Check whether the expected item is now active
+    target = find_nav_item(all_items, expected_label)
+    if target and target.get("active"):
+        print(f"Navigation confirmed: now on '{target['label']}'")
+        return True
+
+    # Fallback: check breadcrumbs
+    breadcrumbs = nav.get("breadcrumbs", [])
+    if any(expected_label.lower() in bc.lower() for bc in breadcrumbs):
+        return True
+
+    print(f"Navigation may have failed — active item does not match '{expected_label}'")
+    return False
+```

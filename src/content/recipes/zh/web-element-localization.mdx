@@ -1,0 +1,261 @@
+---
+title: 网页 UI 元素定位与点击
+description: 让 agent 截图后通过 VLM 识别目标按钮/链接/输入框的坐标，再用 pyautogui 或 Playwright 自动点击，适用于 CSS 选择器不可靠的动态页面。
+category: ui-grounding
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 web automation agent 需要操作一个动态页面——按钮由 React 渲染、class 名称每次构建都会变、iframe 嵌套导致 CSS 选择器极不稳定。常规的 `document.querySelector` 方案随时失效。
+
+解决思路：**截图 → VLM 定位 → 坐标点击**。让模型直接"看"页面，返回目标元素的归一化坐标（0–1 区间），再换算成像素后驱动鼠标点击。
+
+典型用例：
+
+- 自动化测试中识别"提交"按钮的真实位置
+- 浏览器 agent 点击动态生成的分页链接
+- RPA 流程中定位表单里的"下一步"按钮
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 坐标精度最高，UI 元素识别能力强 |
+| **Claude 3.5 Sonnet** | 对复杂布局的理解更准确，少误判 |
+
+两者均支持传入 base64 图片；优先用 GPT-4o，如遇到密集 UI 布局可切换 Claude。
+
+## Prompt 模板
+
+```text
+你是一个网页 UI 分析专家。请在截图中找到以下目标元素，并返回其边界框的归一化坐标。
+
+目标元素描述：{target_description}
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{
+  "found": true,
+  "element_description": "对找到元素的简短描述",
+  "bbox": {
+    "x_min": 0.0,
+    "y_min": 0.0,
+    "x_max": 0.0,
+    "y_max": 0.0
+  },
+  "center": {
+    "x": 0.0,
+    "y": 0.0
+  }
+}
+
+说明：
+- 所有坐标均为归一化值（0.0 到 1.0），相对于图片宽高
+- center 是边界框中心点
+- 如果找不到目标元素，返回 {"found": false, "reason": "..."}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+import time
+from pathlib import Path
+
+import mss
+import pyautogui
+from openai import OpenAI
+from PIL import Image
+
+client = OpenAI()
+
+
+def take_screenshot(save_path: str = "/tmp/screen.png") -> tuple[str, int, int]:
+    """截取全屏并保存，返回 (路径, 宽, 高)"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]  # 主显示器
+        screenshot = sct.grab(monitor)
+        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+        img.save(save_path)
+        return save_path, screenshot.width, screenshot.height
+
+
+def locate_element(image_path: str, target_description: str) -> dict:
+    """调用 VLM 定位目标元素，返回归一化坐标"""
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+
+    prompt = f"""你是一个网页 UI 分析专家。请在截图中找到以下目标元素，并返回其边界框的归一化坐标。
+
+目标元素描述：{target_description}
+
+返回格式（严格 JSON，不要有任何其他文字）：
+{{
+  "found": true,
+  "element_description": "对找到元素的简短描述",
+  "bbox": {{
+    "x_min": 0.0,
+    "y_min": 0.0,
+    "x_max": 0.0,
+    "y_max": 0.0
+  }},
+  "center": {{
+    "x": 0.0,
+    "y": 0.0
+  }}
+}}
+
+如果找不到目标元素，返回 {{"found": false, "reason": "..."}}"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "你是 UI 元素定位助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=256,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+def click_element(target_description: str, confidence_check: bool = True) -> bool:
+    """
+    截图 → VLM 定位 → 坐标换算 → 点击
+    返回 True 表示成功点击
+    """
+    # 1. 截图
+    img_path, screen_w, screen_h = take_screenshot()
+    print(f"截图尺寸: {screen_w}x{screen_h}")
+
+    # 2. VLM 定位
+    result = locate_element(img_path, target_description)
+    print(f"VLM 返回: {json.dumps(result, ensure_ascii=False)}")
+
+    if not result.get("found"):
+        print(f"未找到元素: {result.get('reason', '未知原因')}")
+        return False
+
+    # 3. 归一化坐标 → 像素坐标
+    cx_norm = result["center"]["x"]
+    cy_norm = result["center"]["y"]
+    pixel_x = int(cx_norm * screen_w)
+    pixel_y = int(cy_norm * screen_h)
+    print(f"点击坐标: ({pixel_x}, {pixel_y})")
+
+    # 4. 执行点击（加入轻微随机偏移，模拟真实用户行为）
+    pyautogui.moveTo(pixel_x, pixel_y, duration=0.3)
+    time.sleep(0.1)
+    pyautogui.click()
+
+    return True
+
+
+# --- Playwright 版本（推荐用于无头浏览器场景）---
+
+def click_element_playwright(page, target_description: str) -> bool:
+    """
+    使用 Playwright 截图后定位并点击
+    page: playwright 的 Page 对象
+    """
+    import io
+
+    # 截取页面截图（字节流）
+    screenshot_bytes = page.screenshot()
+    img = Image.open(io.BytesIO(screenshot_bytes))
+    screen_w, screen_h = img.size
+
+    # 保存临时文件
+    tmp_path = "/tmp/playwright_screen.png"
+    img.save(tmp_path)
+
+    result = locate_element(tmp_path, target_description)
+    if not result.get("found"):
+        return False
+
+    pixel_x = int(result["center"]["x"] * screen_w)
+    pixel_y = int(result["center"]["y"] * screen_h)
+
+    page.mouse.click(pixel_x, pixel_y)
+    return True
+
+
+if __name__ == "__main__":
+    # 示例：点击页面上的"登录"按钮
+    success = click_element("蓝色的'登录'按钮，通常在页面右上角")
+    print("点击成功" if success else "点击失败")
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pyautogui pillow
+# 如需 Playwright 版
+pip install playwright && playwright install chromium
+```
+
+## 踩坑记录
+
+**坑 1：模型返回的是归一化坐标，不是像素——必须乘以屏幕尺寸**
+
+最常见的新手错误：模型说 `"center": {"x": 0.75, "y": 0.12}`，直接把 0.75 当成像素传给 pyautogui，结果点到屏幕左上角角落。
+
+正确做法：`pixel_x = int(0.75 * screen_width)`。截图时务必记录屏幕分辨率，Retina 屏（2x DPI）需要额外注意——mss 返回的是物理像素，而 pyautogui 使用逻辑像素，需要除以设备像素比。
+
+```python
+import subprocess, json
+
+def get_dpi_scale() -> float:
+    """macOS 获取设备像素比"""
+    result = subprocess.run(
+        ["system_profiler", "SPDisplaysDataType", "-json"],
+        capture_output=True, text=True
+    )
+    # 简化处理：Retina 屏返回 2.0，普通屏返回 1.0
+    return 2.0 if "Retina" in result.stdout else 1.0
+```
+
+**坑 2：元素被遮挡或 z-index 问题**
+
+弹出的 cookie 提示、悬浮的客服按钮可能覆盖目标元素。模型会"看到"最上层的元素。建议在截图前先检查并关闭常见遮挡层：
+
+```python
+# Playwright 示例：关闭 cookie 横幅
+try:
+    page.locator("[class*='cookie']").click(timeout=2000)
+except:
+    pass  # 没有就跳过
+```
+
+**坑 3：目标元素滚动到屏幕外**
+
+截图时元素可能不在可视区域内。如果模型返回 `"found": false` 且原因涉及"不可见"，需要先滚动：
+
+```python
+# 先让 VLM 判断元素是否在当前视口
+# 如果不在，尝试向下滚动后重新截图
+def scroll_and_locate(page, target_description: str, max_scrolls: int = 5):
+    for i in range(max_scrolls):
+        result = locate_element_playwright(page, target_description)
+        if result.get("found"):
+            return result
+        page.mouse.wheel(0, 500)  # 向下滚动 500px
+        page.wait_for_timeout(300)
+    return {"found": false, "reason": "滚动后仍未找到"}
+```

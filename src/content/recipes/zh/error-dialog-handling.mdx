@@ -1,0 +1,293 @@
+---
+title: 错误弹窗识别与自动处理
+description: Agent 执行多步任务时遇到意外错误弹窗，自动识别弹窗类型（可恢复 vs 致命），并决定关闭、重试或上报人工处理。
+category: computer-use
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+Agent 正在执行多步任务（例如批量文件处理、表单填写），中途屏幕上突然弹出错误对话框。Agent 必须：
+
+1. **检测**是否存在错误弹窗
+2. **分类**错误类型：可恢复（如文件不存在、网络超时）还是致命（如权限被拒绝、磁盘已满）
+3. **决策**：关闭弹窗继续、重试操作、或上报人工处理
+
+本 recipe 展示如何让 VLM 完成这三步，并提供处理三类常见弹窗的代码框架。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 对各种 OS 和应用弹窗样式识别准确 |
+| **Claude 3.5 Sonnet** | 分类逻辑更严谨，误报率低 |
+
+两个模型在这个任务上差距不大，优先用当前项目已集成的模型即可。
+
+## Prompt 模板
+
+```text
+你是一个 computer-use agent 的错误处理模块。
+
+请分析截图，判断是否存在错误、警告或确认对话框，并以 JSON 返回：
+
+{
+  "has_dialog": true 或 false,
+  "dialog_type": "error" | "warning" | "confirmation" | "security" | "info" | null,
+  "dialog_source": "os" | "app" | "browser" | "antivirus" | null,
+  "message_summary": "弹窗内容的一句话摘要（如无弹窗则为 null）",
+  "severity": "fatal" | "recoverable" | "info" | null,
+  "recommended_action": "dismiss" | "retry" | "ask_human" | "none",
+  "button_to_click": "需要点击的按钮文字（如 '确定'、'取消'、'重试'），如不需要点击则为 null",
+  "reasoning": "你的判断依据（1-2句）"
+}
+
+严重程度判断规则：
+- fatal: 权限拒绝、磁盘已满、系统崩溃、驱动错误
+- recoverable: 文件未找到、网络超时、临时锁定、格式错误
+- info: 操作完成提示、软件更新通知
+
+安全规则：所有 security 和 antivirus 类型的弹窗，recommended_action 必须为 "ask_human"。
+```
+
+## 代码示例
+
+```python
+import base64
+import io
+import json
+import time
+from enum import Enum
+
+import mss
+import pyautogui
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI()
+
+
+class DialogAction(str, Enum):
+    DISMISS = "dismiss"
+    RETRY = "retry"
+    ASK_HUMAN = "ask_human"
+    NONE = "none"
+
+
+DIALOG_PROMPT = """你是一个 computer-use agent 的错误处理模块。
+
+请分析截图，判断是否存在错误、警告或确认对话框，并以 JSON 返回：
+
+{
+  "has_dialog": true 或 false,
+  "dialog_type": "error" | "warning" | "confirmation" | "security" | "info" | null,
+  "dialog_source": "os" | "app" | "browser" | "antivirus" | null,
+  "message_summary": "弹窗内容的一句话摘要（如无弹窗则为 null）",
+  "severity": "fatal" | "recoverable" | "info" | null,
+  "recommended_action": "dismiss" | "retry" | "ask_human" | "none",
+  "button_to_click": "需要点击的按钮文字，如不需要点击则为 null",
+  "reasoning": "你的判断依据（1-2句）"
+}
+
+安全规则：所有 security 和 antivirus 类型的弹窗，recommended_action 必须为 "ask_human"。
+只输出 JSON，不要有任何多余文字。"""
+
+
+def take_screenshot() -> str:
+    """截图并返回 base64 编码的 PNG 字符串。"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def analyze_dialog(screenshot_b64: str) -> dict:
+    """调用 VLM 分析截图中的弹窗。"""
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "你是弹窗分析助手，只输出 JSON。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": DIALOG_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=512,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def find_button_coordinate(screenshot_b64: str, button_text: str) -> tuple[int, int] | None:
+    """在截图中定位指定文字按钮的坐标。"""
+    prompt = f"""在截图中找到文字为 "{button_text}" 的按钮，返回其中心点坐标：
+{{"x": 像素x坐标, "y": 像素y坐标}}
+如果找不到该按钮，返回 {{"x": null, "y": null}}。
+只输出 JSON。"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+        max_tokens=128,
+    )
+    result = json.loads(response.choices[0].message.content)
+    x, y = result.get("x"), result.get("y")
+    if x is not None and y is not None:
+        return (int(x), int(y))
+    return None
+
+
+def handle_dialog(
+    analysis: dict,
+    screenshot_b64: str,
+    on_ask_human=None,
+    max_retries: int = 3,
+    retry_count: int = 0,
+) -> str:
+    """根据分析结果处理弹窗，返回处理结果描述。"""
+    if not analysis.get("has_dialog"):
+        return "no_dialog"
+
+    action = analysis.get("recommended_action", DialogAction.NONE)
+    summary = analysis.get("message_summary", "未知错误")
+    severity = analysis.get("severity")
+    button_text = analysis.get("button_to_click")
+
+    print(f"检测到弹窗: {summary}")
+    print(f"严重程度: {severity} | 推荐操作: {action}")
+
+    if action == DialogAction.ASK_HUMAN:
+        msg = f"[需要人工处理] {summary}\n来源: {analysis.get('dialog_source')}"
+        if on_ask_human:
+            on_ask_human(msg, analysis)
+        else:
+            print(msg)
+            input("请处理弹窗后按 Enter 继续...")
+        return "human_handled"
+
+    if action == DialogAction.DISMISS and button_text:
+        coord = find_button_coordinate(screenshot_b64, button_text)
+        if coord:
+            pyautogui.click(coord[0], coord[1])
+            time.sleep(0.5)
+            return "dismissed"
+        else:
+            # 找不到按钮时尝试按 Escape
+            pyautogui.press("escape")
+            time.sleep(0.5)
+            return "dismissed_via_escape"
+
+    if action == DialogAction.RETRY:
+        if retry_count >= max_retries:
+            print(f"已重试 {max_retries} 次，转为人工处理。")
+            if on_ask_human:
+                on_ask_human(f"重试失败: {summary}", analysis)
+            return "retry_exhausted"
+        time.sleep(2 ** retry_count)  # 指数退避
+        return "retry"
+
+    return "no_action"
+
+
+def check_and_handle_dialog(
+    on_ask_human=None,
+    retry_count: int = 0,
+) -> str:
+    """截图并完整地检测 + 处理弹窗，返回处理结果。"""
+    screenshot = take_screenshot()
+    analysis = analyze_dialog(screenshot)
+    return handle_dialog(
+        analysis,
+        screenshot,
+        on_ask_human=on_ask_human,
+        retry_count=retry_count,
+    )
+
+
+# 在 agent 主循环中的使用示例
+def agent_step_with_dialog_handling(step_fn, on_ask_human=None):
+    """执行一个 agent 步骤，遇到弹窗时自动处理。"""
+    retry_count = 0
+    while True:
+        result = check_and_handle_dialog(on_ask_human=on_ask_human, retry_count=retry_count)
+
+        if result == "no_dialog":
+            # 没有弹窗，正常执行步骤
+            step_fn()
+            return
+        elif result in ("dismissed", "dismissed_via_escape", "human_handled"):
+            # 弹窗已处理，重新检查屏幕状态再执行
+            time.sleep(0.5)
+            continue
+        elif result == "retry":
+            retry_count += 1
+            step_fn()
+        elif result == "retry_exhausted":
+            raise RuntimeError("多次重试失败，任务中止。")
+
+
+if __name__ == "__main__":
+    def dummy_step():
+        print("执行任务步骤...")
+
+    def human_handler(msg, analysis):
+        print(f"\n{'='*50}")
+        print(msg)
+        print(f"{'='*50}")
+        input("处理完成后按 Enter...")
+
+    agent_step_with_dialog_handling(dummy_step, on_ask_human=human_handler)
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## 踩坑记录
+
+**坑 1：OS 级弹窗与应用级弹窗外观不同，处理方式也不同**
+
+Windows UAC 提示、macOS 权限对话框是系统级别的，样式固定且通常需要管理员权限确认；应用内弹窗则样式五花八门。VLM 需要区分两者，因为 OS 级弹窗通常无法用 `pyautogui` 直接点击（需要管理员权限或特殊 API）。
+
+在 prompt 中加入 `dialog_source` 字段，明确区分 `"os"` / `"app"` / `"browser"` / `"antivirus"`，并在代码中根据来源选择不同的处理策略。
+
+**坑 2：「是否保存更改？」类弹窗需要领域知识**
+
+关闭文档时弹出"保存更改？"，agent 必须知道：这次操作的目的是什么？是要保存还是放弃？如果 agent 不清楚上下文，错误点击"不保存"可能导致数据丢失。
+
+这类弹窗应该归类为 `dialog_type: "confirmation"`，并且 `recommended_action` 强制为 `"ask_human"`，除非上下文中已有明确指令（例如任务描述中说"关闭文档，不保存"）。在 prompt 中明确这条规则。
+
+**坑 3：杀毒软件 / 安全警告弹窗必须上报人工**
+
+杀毒软件拦截提示、Windows Defender SmartScreen、macOS Gatekeeper 弹窗，外观可能和普通"确认"弹窗非常相似，但随意点击"允许"或"继续"可能造成安全风险。
+
+在 prompt 中硬编码规则：**`dialog_source` 为 `"antivirus"` 或 `dialog_type` 为 `"security"` 时，`recommended_action` 必须为 `"ask_human"`**。代码层面也要二次检查，不信任 VLM 对安全弹窗的自动处理。

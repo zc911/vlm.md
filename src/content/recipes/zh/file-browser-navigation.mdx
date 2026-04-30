@@ -1,0 +1,289 @@
+---
+title: 文件浏览器导航自动化
+description: 让 agent 在 Windows Explorer、macOS Finder 或 Linux 文件管理器中自动定位文件、执行移动/重命名/删除等操作，基于窗口视觉状态决策。
+category: computer-use
+lang: zh
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+Agent 需要在图形文件浏览器中完成任务，例如：
+
+- 定位特定文件或文件夹
+- 重命名文件
+- 将文件从一个目录移动到另一个目录
+- 删除临时文件
+
+与直接调用 `os.rename()` 或 `shutil.move()` 不同，这里的场景是 agent 只能通过屏幕视觉操作 GUI（例如远程桌面、无代码执行权限的环境）。Agent 需要识别文件浏览器的当前路径、可见文件列表，并通过点击、双击、右键菜单完成操作。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **Claude 3.5 Sonnet** | 对文件浏览器 UI 元素（地址栏、文件列表、面板）识别稳定 |
+| **GPT-4o** | 跨平台（Windows/macOS/Linux）泛化性好 |
+
+两者差距不大，任选其一。如果目标是跨平台场景，GPT-4o 更稳定。
+
+## Prompt 模板
+
+```text
+你是一个操作文件浏览器的 computer-use agent。
+
+请分析截图中的文件浏览器窗口，以 JSON 返回：
+
+{
+  "platform": "windows" | "macos" | "linux" | "unknown",
+  "current_path": "地址栏显示的当前路径，如 /Users/alice/Documents",
+  "visible_items": [
+    {"name": "文件或文件夹名", "type": "file" | "folder", "is_selected": true 或 false}
+  ],
+  "target_visible": true 或 false,
+  "target_item": "目标文件/文件夹名，如果可见的话",
+  "needs_scroll": true 或 false,
+  "needs_show_hidden": false,
+  "next_action": {
+    "type": "double_click" | "right_click" | "click" | "type" | "key" | "scroll" | "wait" | "done" | "ask_human",
+    "target": "操作目标描述",
+    "coordinate": [x, y],
+    "text": "输入文字（如果 type）",
+    "key": "按键名（如果 key）",
+    "reason": "操作理由"
+  }
+}
+
+任务目标：{goal}
+```
+
+## 代码示例
+
+```python
+import base64
+import io
+import json
+import subprocess
+import sys
+import time
+
+import mss
+import pyautogui
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI()
+
+
+def take_screenshot() -> str:
+    """截图并返回 base64 编码的 PNG 字符串。"""
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+
+def open_file_browser(path: str = None) -> None:
+    """打开系统文件浏览器，可选指定起始路径。"""
+    if sys.platform == "darwin":
+        cmd = ["open", path or "~"]
+    elif sys.platform == "win32":
+        cmd = ["explorer", path or "C:\\"]
+    else:
+        # Linux：尝试 nautilus / thunar / nemo
+        for fm in ("nautilus", "thunar", "nemo", "dolphin"):
+            try:
+                subprocess.Popen([fm, path or str(Path.home())])
+                return
+            except FileNotFoundError:
+                continue
+        raise RuntimeError("未找到可用的文件管理器")
+    subprocess.Popen(cmd)
+    time.sleep(1.5)  # 等待窗口打开
+
+
+SYSTEM_PROMPT = """你是操作文件浏览器的 computer-use agent。
+分析截图中的文件浏览器并以 JSON 返回操作决策。只输出 JSON，不要有多余文字。"""
+
+
+def analyze_and_decide(screenshot_b64: str, goal: str, history: list[dict]) -> dict:
+    """调用 VLM 分析文件浏览器状态并决定下一步操作。"""
+    history_text = "\n".join(
+        f"步骤 {i+1}: {json.dumps(h, ensure_ascii=False)}" for i, h in enumerate(history)
+    )
+
+    prompt = f"""分析文件浏览器截图，以 JSON 返回：
+
+{{
+  "platform": "windows" | "macos" | "linux" | "unknown",
+  "current_path": "当前路径",
+  "visible_items": [{{"name": "名称", "type": "file|folder", "is_selected": false}}],
+  "target_visible": true 或 false,
+  "needs_scroll": true 或 false,
+  "needs_show_hidden": false,
+  "next_action": {{
+    "type": "double_click|right_click|click|type|key|scroll|wait|done|ask_human",
+    "target": "目标描述",
+    "coordinate": [x, y],
+    "text": "输入内容（如适用）",
+    "key": "按键（如适用）",
+    "reason": "操作理由"
+  }}
+}}
+
+任务目标：{goal}
+
+已执行的操作历史：
+{history_text if history else "（无）"}
+
+只输出 JSON。"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def execute_file_action(action: dict) -> str:
+    """执行文件浏览器操作，返回操作描述。"""
+    t = action.get("type")
+    coord = action.get("coordinate")
+
+    if t == "double_click" and coord:
+        pyautogui.doubleClick(coord[0], coord[1])
+        return f"双击 ({coord[0]}, {coord[1]})"
+
+    elif t == "right_click" and coord:
+        pyautogui.rightClick(coord[0], coord[1])
+        time.sleep(0.3)
+        return f"右键 ({coord[0]}, {coord[1]})"
+
+    elif t == "click" and coord:
+        pyautogui.click(coord[0], coord[1])
+        return f"点击 ({coord[0]}, {coord[1]})"
+
+    elif t == "type":
+        pyautogui.typewrite(action["text"], interval=0.05)
+        return f"输入: {action['text']!r}"
+
+    elif t == "key":
+        pyautogui.press(action["key"])
+        return f"按键: {action['key']}"
+
+    elif t == "scroll":
+        direction = action.get("direction", "down")
+        clicks = action.get("clicks", 5)
+        if coord:
+            pyautogui.scroll(clicks if direction == "up" else -clicks, x=coord[0], y=coord[1])
+        else:
+            pyautogui.scroll(clicks if direction == "up" else -clicks)
+        return f"滚动 {direction}"
+
+    elif t == "wait":
+        duration = action.get("duration", 1)
+        time.sleep(duration)
+        return f"等待 {duration}s"
+
+    elif t == "done":
+        return "DONE"
+
+    elif t == "ask_human":
+        print(f"\n[需要人工介入] {action.get('reason')}")
+        input("请处理后按 Enter 继续...")
+        return "人工介入完成"
+
+    return f"未知操作: {t}"
+
+
+def navigate_file_browser(goal: str, start_path: str = None, max_steps: int = 25) -> None:
+    """
+    打开文件浏览器并让 agent 自动完成文件导航任务。
+
+    参数：
+        goal: 任务描述，例如 "找到 ~/Documents/report.pdf 并重命名为 report_final.pdf"
+        start_path: 起始路径，None 表示默认位置
+        max_steps: 最大操作步数
+    """
+    print(f"任务: {goal}")
+    open_file_browser(start_path)
+
+    history: list[dict] = []
+
+    for step in range(1, max_steps + 1):
+        print(f"\n--- 步骤 {step} ---")
+
+        screenshot = take_screenshot()
+        result = analyze_and_decide(screenshot, goal, history)
+
+        print(f"当前路径: {result.get('current_path')}")
+        print(f"目标可见: {result.get('target_visible')} | 需滚动: {result.get('needs_scroll')}")
+
+        next_action = result.get("next_action", {})
+        print(f"下一步: {next_action.get('type')} — {next_action.get('reason')}")
+
+        if next_action.get("type") == "done":
+            print("\n任务完成！")
+            break
+
+        desc = execute_file_action(next_action)
+        history.append({"step": step, "action": next_action, "desc": desc})
+        time.sleep(0.6)
+    else:
+        print(f"\n已达最大步数 ({max_steps})。")
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+    navigate_file_browser(
+        goal="在 Downloads 文件夹中找到名为 'report.pdf' 的文件，将其移动到 Documents 文件夹",
+        start_path=str(Path.home() / "Downloads"),
+    )
+```
+
+安装依赖：
+
+```bash
+pip install openai mss pillow pyautogui
+```
+
+## 踩坑记录
+
+**坑 1：文件排序方式影响目标文件是否可见**
+
+文件浏览器默认按名称排序，但也可能按修改时间、大小或类型排序。如果目标文件排在列表中部或末尾，窗口默认视图可能看不到它。Agent 如果没有滚动就找不到文件，会误报"文件不存在"。
+
+解决方案：在 prompt 中加入 `needs_scroll` 字段，VLM 判断目标文件是否不在当前可见区域。如果 `needs_scroll` 为 `true`，先执行滚动，再重新截图判断。也可以让 agent 使用文件浏览器的搜索功能（Cmd+F 或 Ctrl+F）直接定位，避免依赖滚动。
+
+**坑 2：隐藏文件默认不显示**
+
+macOS 和 Linux 的配置文件通常以 `.` 开头（`.bashrc`、`.env`、`.ssh/`），Windows 也有系统隐藏文件。文件浏览器默认不显示这些文件，agent 会误以为它们不存在。
+
+解决方案：在 prompt 中加入 `needs_show_hidden` 字段。如果任务目标文件名以 `.` 开头或明确是配置文件，VLM 应将该字段设为 `true`，agent 在继续前先开启"显示隐藏文件"（macOS: Cmd+Shift+. ，Windows: 视图 → 隐藏项目，Linux: Ctrl+H）。
+
+**坑 3：网络驱动器和符号链接视觉上与普通文件夹相同**
+
+网络共享目录（SMB、NFS）和符号链接在 Finder/Explorer 中看起来和普通文件夹几乎一模一样，只有图标有细微差异。Agent 如果对网络驱动器执行"移动"操作，可能触发跨网络传输，速度极慢且可能失败；对符号链接执行"删除"只会删除链接本身，不影响原文件，但 agent 可能误以为任务失败（文件依然存在于原路径）。
+
+解决方案：对于移动、删除等破坏性操作，在 prompt 中要求 VLM 说明目标是否可能是网络驱动器或符号链接，如果不确定则 `recommended_action` 设为 `"ask_human"`。
