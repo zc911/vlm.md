@@ -149,8 +149,10 @@ def preprocess_image(path: str) -> str:
     img = Image.open(path)
     if max(img.size) > 2048:
         img.thumbnail((2048, 2048))
-        path = path.replace(".", "_resized.")
-        img.save(path)
+        stem, ext = path.rsplit(".", 1)
+        out = f"{stem}_resized.{ext}"
+        img.save(out)
+        return out
     return path
 ```
 
