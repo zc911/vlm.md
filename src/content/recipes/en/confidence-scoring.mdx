@@ -1,0 +1,288 @@
+---
+title: Structured Output with Confidence Scores
+description: When extracting structured data from low-quality images (blurry scans, poor lighting), have the model report a per-field confidence score so the system can automatically flag fields for human review.
+category: structured-output
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent needs to extract structured data from low-quality images — blurry scans, phone photos in bad lighting, faded old documents. The problem: some fields may not be accurately readable, and if the model silently returns wrong values, downstream systems consume bad data without any indication something went wrong.
+
+The solution is to have the model report a **per-field confidence score** (0.0–1.0). The system then automatically routes low-confidence fields to a human review queue.
+
+This pattern is especially valuable when:
+- Insurance claim document recognition (errors are costly)
+- Historical archive digitization (image quality is consistently low)
+- Medical form OCR (missing or incorrect fields are unacceptable)
+
+## Recommended Models
+
+| Model | Use Case |
+|---|---|
+| **GPT-4o** | Most accurate confidence estimation, strong visual understanding — first choice |
+| **Claude 3.5 Sonnet** | More consistent structured output format, more conservative confidence reporting |
+
+Both models tend to overestimate confidence. You'll need to calibrate thresholds against known low-quality images before using in production.
+
+## Prompt Template
+
+```text
+You are a document information extraction expert. Extract the following fields from the image and assign a confidence score (0.0–1.0) to each field.
+
+Confidence definitions:
+- 1.0: Field is clearly visible, no ambiguity
+- 0.7–0.9: Visible but slightly blurry or uncertain
+- 0.4–0.6: Partially obscured or faded, some guesswork involved
+- 0.0–0.3: Severely blurry, obscured, or unreadable
+
+Return format (each field includes value and confidence):
+{
+  "fields": {
+    "<field_name>": {
+      "value": <extracted value, or null if unreadable>,
+      "confidence": <float between 0.0 and 1.0>
+    }
+  }
+}
+
+Notes:
+- Do not inflate confidence to appear more helpful
+- If you genuinely cannot read a field, confidence should be below 0.3 and value should be null
+- Output JSON only, no extra text
+```
+
+## Code Example
+
+```python
+import base64
+import json
+from pathlib import Path
+from typing import Optional, Any
+from openai import OpenAI
+from pydantic import BaseModel, Field, field_validator
+
+client = OpenAI()
+
+
+class FieldResult(BaseModel):
+    value: Optional[Any] = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("confidence")
+    @classmethod
+    def clamp_confidence(cls, v: float) -> float:
+        return max(0.0, min(1.0, v))
+
+
+class ExtractionResult(BaseModel):
+    fields: dict[str, FieldResult]
+
+    def low_confidence_fields(self, threshold: float = 0.6) -> list[str]:
+        """Return names of fields whose confidence is below the threshold."""
+        return [
+            name
+            for name, result in self.fields.items()
+            if result.confidence < threshold
+        ]
+
+    def to_values(self) -> dict[str, Any]:
+        """Return field values only (without confidence), for passing to downstream systems."""
+        return {name: result.value for name, result in self.fields.items()}
+
+    def confidence_report(self) -> str:
+        """Generate a human-readable confidence report."""
+        lines = ["Field Confidence Report:"]
+        for name, result in self.fields.items():
+            bar = "█" * int(result.confidence * 10) + "░" * (10 - int(result.confidence * 10))
+            flag = " ⚠ needs review" if result.confidence < 0.6 else ""
+            lines.append(f"  {name:20s} [{bar}] {result.confidence:.2f}  value={result.value!r}{flag}")
+        return "\n".join(lines)
+
+
+def extract_with_confidence(
+    image_path: str,
+    field_names: list[str],
+    confidence_threshold: float = 0.6,
+    max_retries: int = 3,
+) -> tuple[ExtractionResult, list[str]]:
+    """
+    Extract fields from an image with per-field confidence scores.
+
+    Returns:
+        (ExtractionResult, list of field names that need human review)
+    """
+    image_data = base64.b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    mime_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    fields_list = "\n".join(f"- {f}" for f in field_names)
+    prompt = f"""You are a document information extraction expert. Extract the following fields from the image and assign a confidence score (0.0–1.0) to each.
+
+Fields to extract:
+{fields_list}
+
+Confidence definitions:
+- 1.0: Field is clearly visible, no ambiguity
+- 0.7–0.9: Visible but slightly blurry or uncertain
+- 0.4–0.6: Partially obscured or faded, some guesswork involved
+- 0.0–0.3: Severely blurry, obscured, or unreadable
+
+Return format:
+{{
+  "fields": {{
+    "<field_name>": {{"value": <extracted value or null>, "confidence": <0.0–1.0>}}
+  }}
+}}
+
+Do not inflate confidence; unreadable fields should have confidence below 0.3 and value null.
+Output JSON only."""
+
+    messages = [
+        {"role": "system", "content": "You are a document extraction assistant. Report confidence for each field honestly."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+
+    from pydantic import ValidationError
+
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            response_format={"type": "json_object"},
+            messages=messages,
+            max_tokens=1024,
+        )
+
+        raw = response.choices[0].message.content
+
+        try:
+            data = json.loads(raw)
+            result = ExtractionResult.model_validate(data)
+            needs_review = result.low_confidence_fields(confidence_threshold)
+            return result, needs_review
+
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_error = e
+            messages.append({"role": "assistant", "content": raw})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Output validation failed (attempt {attempt + 1}): {e}. "
+                        "Please ensure every field includes value and confidence (a float between 0.0 and 1.0)."
+                    ),
+                }
+            )
+
+    raise RuntimeError(f"Failed after {max_retries} attempts. Last error: {last_error}")
+
+
+def route_for_review(
+    result: ExtractionResult,
+    needs_review: list[str],
+    record_id: str,
+) -> dict:
+    """Route extraction results: high-confidence fields pass automatically, low-confidence go to review queue."""
+    auto_approved = {
+        name: val
+        for name, val in result.to_values().items()
+        if name not in needs_review
+    }
+    pending_review = {
+        name: {
+            "value": result.fields[name].value,
+            "confidence": result.fields[name].confidence,
+        }
+        for name in needs_review
+    }
+
+    return {
+        "record_id": record_id,
+        "auto_approved": auto_approved,
+        "pending_review": pending_review,
+        "review_required": len(needs_review) > 0,
+    }
+
+
+if __name__ == "__main__":
+    field_names = [
+        "patient_name",
+        "date_of_birth",
+        "diagnosis_code",
+        "prescription_date",
+        "doctor_signature",
+    ]
+
+    result, needs_review = extract_with_confidence(
+        "medical_form_scan.jpg",
+        field_names=field_names,
+        confidence_threshold=0.6,
+    )
+
+    print(result.confidence_report())
+    print()
+
+    routed = route_for_review(result, needs_review, record_id="REC-001")
+    print(json.dumps(routed, indent=2))
+```
+
+Expected output (low-quality scan scenario):
+
+```json
+{
+  "record_id": "REC-001",
+  "auto_approved": {
+    "patient_name": "John Smith",
+    "prescription_date": "2024-03-15"
+  },
+  "pending_review": {
+    "date_of_birth": {"value": "1985-??-12", "confidence": 0.45},
+    "diagnosis_code": {"value": null, "confidence": 0.2},
+    "doctor_signature": {"value": "illegible signature", "confidence": 0.35}
+  },
+  "review_required": true
+}
+```
+
+## Pitfalls
+
+**Pitfall 1: Models systematically overestimate confidence**
+
+VLMs tend to report higher confidence than warranted — a clearly blurry image might still get a 0.8 confidence score. This happens because models lean toward appearing helpful rather than honestly reporting uncertainty.
+
+Fix: Test against known low-quality images, observe the actual accuracy at each confidence level, then **raise** your threshold (e.g., from 0.6 to 0.75 for "needs review"). Don't treat the model's confidence as an absolute measure of reliability.
+
+**Pitfall 2: "Confidence" has two distinct meanings — be explicit**
+
+- **Legibility confidence**: Is the text in the image clear enough to read? (OCR quality)
+- **Semantic confidence**: Does the model understand what the field means? (e.g., handwritten medical abbreviations)
+
+These vary independently: legible text that the model doesn't understand → high legibility confidence, low semantic confidence.
+
+Be explicit in your prompt about which type you need (usually legibility confidence):
+
+```text
+Confidence reflects only how clearly the text appears in the image, not how well you understand its meaning.
+```
+
+**Pitfall 3: Don't ask for an overall confidence score — go per-field**
+
+If you ask the model to give a single overall confidence score for the entire output, it averages everything and masks the fact that a few critical fields are completely unreliable.
+
+Per-field confidence is what gives you actionable routing: the system knows exactly which fields need human confirmation and which can pass automatically, rather than treating the entire batch as pass-or-fail.

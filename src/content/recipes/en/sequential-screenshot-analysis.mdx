@@ -1,0 +1,246 @@
+---
+title: Analyze Sequential Screenshots for Action Replay
+description: Have your agent receive a series of session screenshots and reconstruct the user's step-by-step actions as a structured action log.
+category: multi-image
+lang: en
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: advanced
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent receives a sequence of 3–8 screenshots from a user session and must read this "visual log" to reconstruct what the user did:
+
+- **Workflow documentation**: record a user completing a task and auto-generate an SOP or user guide
+- **Bug reproduction**: given a sequence of screenshots in a bug report, reconstruct the exact path that triggered the issue
+- **Onboarding analysis**: identify which step in an onboarding flow a user got stuck on
+
+Output: an ordered list of actions — each step describes what the user did, where they acted, and what changed.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best for sequences of 4 or fewer screenshots; strong reasoning |
+| **Gemini 1.5 Pro** | Handles 8+ images; more stable with long multi-image context |
+
+Use GPT-4o for &lt;= 4 screenshots, switch to Gemini 1.5 Pro for &gt;= 5 or when you need higher image limits.
+
+## Prompt Template
+
+```text
+You are a user behavior analyst. Below is a time-ordered sequence of session screenshots, each labeled with an index and timestamp.
+Analyze the screenshots and reconstruct the user's actions. Return ONLY the following JSON — no explanation, no markdown.
+
+{
+  "task_summary": "One sentence describing what task the user was doing",
+  "total_duration_seconds": estimated total time in seconds (integer),
+  "steps": [
+    {
+      "step": step number (starting from 1),
+      "screenshot_index": index of the corresponding screenshot,
+      "action": "Action type (e.g. click, type, scroll, wait)",
+      "target": "The UI element or area acted upon",
+      "result": "How the interface changed after the action",
+      "timestamp": "Timestamp from the screenshot label (if present)"
+    }
+  ],
+  "observations": ["Additional behavioral observations — hesitation, repeated attempts, long wait times, etc."]
+}
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are a user behavior analyst. Output JSON only — no explanation, no markdown."
+
+ANALYSIS_PROMPT = """You are a user behavior analyst. Below is a time-ordered sequence of session screenshots, each labeled with an index and timestamp.
+Analyze the screenshots and reconstruct the user's actions. Return ONLY the following JSON — no explanation, no markdown.
+
+{
+  "task_summary": "One sentence describing what task the user was doing",
+  "total_duration_seconds": estimated total time in seconds (integer),
+  "steps": [
+    {
+      "step": step number (starting from 1),
+      "screenshot_index": index of the corresponding screenshot,
+      "action": "Action type (e.g. click, type, scroll, wait)",
+      "target": "The UI element or area acted upon",
+      "result": "How the interface changed after the action",
+      "timestamp": "Timestamp from the screenshot label (if present)"
+    }
+  ],
+  "observations": ["Additional behavioral observations — hesitation, repeated attempts, long wait times, etc."]
+}"""
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def analyze_screenshot_sequence(
+    screenshot_paths: list[str],
+    timestamps: list[str] | None = None,
+) -> dict:
+    """
+    Analyze a sequence of screenshots and reconstruct user actions.
+
+    Args:
+        screenshot_paths: Time-ordered list of screenshot file paths (max 8 for GPT-4o).
+        timestamps: Optional list of timestamp strings matching each screenshot.
+    """
+    if len(screenshot_paths) > 8:
+        raise ValueError("GPT-4o supports up to ~8 images per call. Switch to Gemini 1.5 Pro for longer sequences.")
+
+    if timestamps is None:
+        timestamps = [f"Screenshot {i + 1}" for i in range(len(screenshot_paths))]
+
+    # Build message content: label each image with its index and timestamp
+    content: list[dict] = []
+    for i, (path, ts) in enumerate(zip(screenshot_paths, timestamps)):
+        data, mime = encode_image(path)
+        content.append({"type": "text", "text": f"[Screenshot {i + 1} | Time: {ts}]"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+
+    content.append({"type": "text", "text": ANALYSIS_PROMPT})
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=2048,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    screenshots = ["step1.png", "step2.png", "step3.png", "step4.png"]
+    timestamps = [
+        "2024-03-15 10:23:00",
+        "2024-03-15 10:23:12",
+        "2024-03-15 10:23:45",
+        "2024-03-15 10:24:01",
+    ]
+
+    result = analyze_screenshot_sequence(screenshots, timestamps)
+    print(json.dumps(result, indent=2))
+```
+
+Run:
+
+```bash
+pip install openai
+python sequential_analysis.py
+```
+
+Expected output:
+
+```json
+{
+  "task_summary": "User searched for and purchased running shoes on an e-commerce site",
+  "total_duration_seconds": 61,
+  "steps": [
+    {
+      "step": 1,
+      "screenshot_index": 1,
+      "action": "type",
+      "target": "Top search bar",
+      "result": "Search query 'running shoes size 10' appears in the input",
+      "timestamp": "2024-03-15 10:23:00"
+    },
+    {
+      "step": 2,
+      "screenshot_index": 2,
+      "action": "click",
+      "target": "Third search result",
+      "result": "Product detail page opened",
+      "timestamp": "2024-03-15 10:23:12"
+    },
+    {
+      "step": 3,
+      "screenshot_index": 3,
+      "action": "scroll",
+      "target": "Product detail page",
+      "result": "Reviews section is now visible",
+      "timestamp": "2024-03-15 10:23:45"
+    },
+    {
+      "step": 4,
+      "screenshot_index": 4,
+      "action": "click",
+      "target": "Buy Now button",
+      "result": "Checkout page loaded",
+      "timestamp": "2024-03-15 10:24:01"
+    }
+  ],
+  "observations": [
+    "User spent ~33 seconds on the product page focused on reviews, suggesting purchase hesitation",
+    "User skipped 'Add to Cart' and went directly to 'Buy Now' — impulse purchase pattern"
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: GPT-4o has image count limits — too many images causes errors or degraded output**
+
+GPT-4o's image limit per API call is approximately 10, but in practice quality degrades beyond 6–8 images. Add a guardrail and route longer sequences to Gemini 1.5 Pro:
+
+```python
+def analyze(screenshots, timestamps=None, model="auto"):
+    if model == "auto":
+        model = "gpt-4o" if len(screenshots) <= 4 else "gemini-1.5-pro"
+    # pass model to the API call...
+```
+
+**Gotcha 2: Without timestamps, the model can't detect wait/loading states**
+
+If 30 seconds passed between two screenshots while the page loaded, but there's no timestamp, the model skips that gap entirely. The reconstructed action sequence silently omits critical timing information. Fix: record timestamps when capturing screenshots, or burn them into the image as an overlay using Pillow:
+
+```python
+from PIL import Image, ImageDraw
+
+def add_timestamp_overlay(image_path: str, timestamp: str, output_path: str) -> None:
+    img = Image.open(image_path).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    # Semi-transparent black bar in top-left corner
+    draw.rectangle([0, 0, 300, 30], fill=(0, 0, 0, 128))
+    draw.text((5, 5), timestamp, fill=(255, 255, 255, 255))
+    img.convert("RGB").save(output_path)
+```
+
+**Gotcha 3: Screenshots may contain PII**
+
+User session screenshots routinely contain names, phone numbers, email addresses, and physical addresses. Redact sensitive regions before sending to any external API. For known layout regions (e.g., a fixed profile header), you can mask them with a black rectangle:
+
+```python
+from PIL import Image, ImageDraw
+
+def redact_regions(image_path: str, regions: list[tuple[int, int, int, int]], output_path: str) -> None:
+    """regions: list of (x1, y1, x2, y2) bounding boxes to black out."""
+    img = Image.open(image_path)
+    draw = ImageDraw.Draw(img)
+    for region in regions:
+        draw.rectangle(region, fill=(0, 0, 0))
+    img.save(output_path)
+```
+
+For automated pipelines, pair this with a PII detection library (e.g., `presidio-analyzer`) to identify sensitive regions before deciding what to redact.

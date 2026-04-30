@@ -1,0 +1,177 @@
+---
+title: 前后图片对比分析
+description: 让 agent 对比两张图片（UI 截图、产品图、文档标注前后）并输出结构化的变更清单。
+category: multi-image
+lang: zh
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+  - Claude 3.5 Sonnet
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要比较同一对象的两个版本，并生成一份变更报告：
+
+- **UI 截图**：前端部署前后的页面截图，找出布局、文字、颜色的变化
+- **产品图**：修图前后的商品照片，识别裁剪、调色、水印等改动
+- **文档标注**：PDF 审阅前后，找出新增批注、删除段落、修改内容
+
+核心需求：不是像素级差异，而是语义层面的"什么发生了变化"。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 均衡首选，对 UI 变更描述准确，JSON 输出稳定 |
+| **Gemini 1.5 Pro** | 对图片细节的感知力强，适合产品图对比 |
+| **Claude 3.5 Sonnet** | 结构化输出质量高，变更分类更精准 |
+
+建议使用 GPT-4o 或 Claude 3.5 Sonnet，二者在结构化 diff 输出上最为可靠。
+
+## Prompt 模板
+
+```text
+你将收到两张图片：第一张是「变更前」，第二张是「变更后」。
+请分析两张图片的语义差异，并严格按以下 JSON 格式输出，不要有任何多余文字。
+
+{
+  "summary": "一句话总结变更",
+  "changes": [
+    {
+      "type": "added" | "removed" | "modified",
+      "element": "发生变化的元素名称或位置描述",
+      "before": "变更前的状态（如不适用则为 null）",
+      "after": "变更后的状态（如不适用则为 null）",
+      "severity": "critical" | "warning" | "info"
+    }
+  ]
+}
+
+注意：
+- 忽略抗锯齿、字体渲染等像素级细微差异
+- 只报告用户可感知的语义变化
+- 如果两张图片完全相同，changes 返回空数组
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "你是一个图片差异分析专家，只输出 JSON，不输出任何其他内容。"
+
+DIFF_PROMPT = """你将收到两张图片：第一张是「变更前」，第二张是「变更后」。
+请分析两张图片的语义差异，并严格按以下 JSON 格式输出，不要有任何多余文字。
+
+{
+  "summary": "一句话总结变更",
+  "changes": [
+    {
+      "type": "added | removed | modified",
+      "element": "发生变化的元素名称或位置描述",
+      "before": "变更前的状态（如不适用则为 null）",
+      "after": "变更后的状态（如不适用则为 null）",
+      "severity": "critical | warning | info"
+    }
+  ]
+}
+
+注意：
+- 忽略抗锯齿、字体渲染等像素级细微差异
+- 只报告用户可感知的语义变化
+- 如果两张图片完全相同，changes 返回空数组"""
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    """返回 (base64_data, mime_type)"""
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def compare_images(before_path: str, after_path: str) -> dict:
+    before_data, before_mime = encode_image(before_path)
+    after_data, after_mime = encode_image(after_path)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    # 明确标注顺序，避免模型混淆 before/after
+                    {"type": "text", "text": "【变更前图片】"},
+                    {"type": "image_url", "image_url": {"url": f"data:{before_mime};base64,{before_data}"}},
+                    {"type": "text", "text": "【变更后图片】"},
+                    {"type": "image_url", "image_url": {"url": f"data:{after_mime};base64,{after_data}"}},
+                    {"type": "text", "text": DIFF_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    result = compare_images("screenshot_before.png", "screenshot_after.png")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+```
+
+运行：
+
+```bash
+pip install openai
+python compare_images.py
+```
+
+预期输出：
+
+```json
+{
+  "summary": "导航栏新增了「帮助」按钮，主标题文字由蓝色改为深灰色",
+  "changes": [
+    {
+      "type": "added",
+      "element": "导航栏 - 帮助按钮",
+      "before": null,
+      "after": "右上角新增「帮助」文字链接",
+      "severity": "info"
+    },
+    {
+      "type": "modified",
+      "element": "主标题文字颜色",
+      "before": "#1a73e8（蓝色）",
+      "after": "#333333（深灰色）",
+      "severity": "warning"
+    }
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：问"有什么不同？"太模糊，输出五花八门**
+
+直接问模型"这两张图有什么不同"，它可能描述光线差异、图片压缩噪点、字体渲染差别……几乎没有可用信息。解决方案：提供结构化输出 schema，明确 `type`（added/removed/modified）和 `severity` 字段，强制模型给出分类清晰的结果。
+
+**坑 2：图片顺序不明确导致 before/after 颠倒**
+
+多图 API 调用中，模型有时会搞不清哪张是"前"哪张是"后"。务必在每张图片前加文字标注，如上面代码中的 `【变更前图片】` / `【变更后图片】`，而不是依赖图片在消息列表中的位置顺序。
+
+**坑 3：抗锯齿和字体微调导致"误报"**
+
+同一页面在不同分辨率或操作系统下截图，字体渲染会有亚像素级差异，VLM 有时会将其报告为"文字样式变化"。在 prompt 中明确要求"忽略抗锯齿、字体渲染等像素级细微差异，只报告用户可感知的语义变化"可以显著减少误报。

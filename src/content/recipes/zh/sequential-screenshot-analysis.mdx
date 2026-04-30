@@ -1,0 +1,258 @@
+---
+title: 连续截图动作序列理解
+description: 让 agent 接收一组用户会话截图，重建操作步骤并输出结构化的动作序列。
+category: multi-image
+lang: zh
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: advanced
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 收到一组用户操作会话的截图（3～8 张），需要从这些"视觉日志"中还原用户的操作步骤：
+
+- **流程重现**：录制用户完成某个任务的操作流程，自动生成操作手册或 SOP
+- **Bug 复现**：从 bug report 附带的截图序列中，还原触发 bug 的操作路径
+- **用户行为分析**：分析用户在 onboarding 流程中哪一步卡住了
+
+输出：一份有序的动作列表，每步说明用户做了什么、在哪里操作、结果是什么。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 适合 4 张以内的截图序列，推理能力强 |
+| **Gemini 1.5 Pro** | 支持更多图片（8 张以上），长上下文处理更稳定 |
+
+截图数量 &lt;= 4 张用 GPT-4o，&gt;= 5 张或需要更大上下文时切换到 Gemini 1.5 Pro。
+
+## Prompt 模板
+
+```text
+你是一个用户行为分析专家。以下是按时间顺序排列的用户会话截图序列（已标注编号和时间戳）。
+请分析这些截图，还原用户的操作步骤，并严格按以下 JSON 格式输出。
+
+{
+  "task_summary": "用户在做什么任务（一句话）",
+  "total_duration_seconds": 预估总耗时（秒数，整数）,
+  "steps": [
+    {
+      "step": 步骤编号（从 1 开始）,
+      "screenshot_index": 对应的截图编号,
+      "action": "用户执行的动作（如：点击、输入、滚动、等待）",
+      "target": "操作的目标元素或区域",
+      "result": "操作导致的界面变化",
+      "timestamp": "截图上的时间戳（如有）"
+    }
+  ],
+  "observations": ["对用户行为的额外观察，如犹豫、重复操作、等待时间长等"]
+}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from datetime import datetime
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "你是用户行为分析专家，只输出 JSON，不输出任何其他内容。"
+
+ANALYSIS_PROMPT = """你是一个用户行为分析专家。以下是按时间顺序排列的用户会话截图序列（已标注编号和时间戳）。
+请分析这些截图，还原用户的操作步骤，并严格按以下 JSON 格式输出。
+
+{
+  "task_summary": "用户在做什么任务（一句话）",
+  "total_duration_seconds": 预估总耗时（秒数，整数）,
+  "steps": [
+    {
+      "step": 步骤编号（从 1 开始）,
+      "screenshot_index": 对应的截图编号,
+      "action": "用户执行的动作（如：点击、输入、滚动、等待）",
+      "target": "操作的目标元素或区域",
+      "result": "操作导致的界面变化",
+      "timestamp": "截图上的时间戳（如有）"
+    }
+  ],
+  "observations": ["对用户行为的额外观察，如犹豫、重复操作、等待时间长等"]
+}"""
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def analyze_screenshot_sequence(
+    screenshot_paths: list[str],
+    timestamps: list[str] | None = None,
+) -> dict:
+    """
+    分析截图序列，还原用户操作步骤。
+
+    Args:
+        screenshot_paths: 按时间顺序排列的截图路径列表（最多 8 张）
+        timestamps: 与截图对应的时间戳列表（可选，格式如 "2024-03-15 10:23:45"）
+    """
+    if len(screenshot_paths) > 8:
+        raise ValueError("GPT-4o 单次调用建议不超过 8 张图片，请改用 Gemini 1.5 Pro")
+
+    if timestamps is None:
+        timestamps = [f"截图 {i + 1}" for i in range(len(screenshot_paths))]
+
+    # 构建消息内容：每张图片前加编号和时间戳标签
+    content: list[dict] = []
+    for i, (path, ts) in enumerate(zip(screenshot_paths, timestamps)):
+        data, mime = encode_image(path)
+        content.append({
+            "type": "text",
+            "text": f"[截图 {i + 1} | 时间：{ts}]",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{data}"},
+        })
+
+    content.append({"type": "text", "text": ANALYSIS_PROMPT})
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ],
+        max_tokens=2048,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    screenshots = [
+        "step1.png",
+        "step2.png",
+        "step3.png",
+        "step4.png",
+    ]
+    timestamps = [
+        "2024-03-15 10:23:00",
+        "2024-03-15 10:23:12",
+        "2024-03-15 10:23:45",
+        "2024-03-15 10:24:01",
+    ]
+
+    result = analyze_screenshot_sequence(screenshots, timestamps)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+```
+
+运行：
+
+```bash
+pip install openai
+python sequential_analysis.py
+```
+
+预期输出：
+
+```json
+{
+  "task_summary": "用户在电商平台搜索并购买了一双运动鞋",
+  "total_duration_seconds": 61,
+  "steps": [
+    {
+      "step": 1,
+      "screenshot_index": 1,
+      "action": "输入",
+      "target": "顶部搜索框",
+      "result": "搜索框中出现文字「运动鞋 男 42码」",
+      "timestamp": "2024-03-15 10:23:00"
+    },
+    {
+      "step": 2,
+      "screenshot_index": 2,
+      "action": "点击",
+      "target": "搜索结果第三项",
+      "result": "进入商品详情页",
+      "timestamp": "2024-03-15 10:23:12"
+    },
+    {
+      "step": 3,
+      "screenshot_index": 3,
+      "action": "滚动",
+      "target": "商品详情页",
+      "result": "查看商品评论区",
+      "timestamp": "2024-03-15 10:23:45"
+    },
+    {
+      "step": 4,
+      "screenshot_index": 4,
+      "action": "点击",
+      "target": "「立即购买」按钮",
+      "result": "跳转至结算页面",
+      "timestamp": "2024-03-15 10:24:01"
+    }
+  ],
+  "observations": [
+    "用户在商品详情页停留约 33 秒，重点浏览了评论区，说明对商品有疑虑",
+    "未将商品加入购物车，直接点击「立即购买」，属于冲动型购买行为"
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：GPT-4o 图片数量有上限，太多图片直接报错**
+
+GPT-4o 对单次 API 调用的图片数量有限制（官方约为 10 张，但实际使用中超过 6～8 张就可能出现性能下降或截断）。截图超过 4 张时建议切换到 Gemini 1.5 Pro，它对多图长上下文的支持更稳健。
+
+```python
+def analyze(screenshots, timestamps=None, model="auto"):
+    if model == "auto":
+        model = "gpt-4o" if len(screenshots) <= 4 else "gemini-1.5-pro"
+    # ...
+```
+
+**坑 2：没有时间戳，模型无法识别"等待"状态**
+
+如果截图之间时间跨度很大（比如用户等待页面加载了 30 秒），但没有时间戳，模型会直接跳过这段等待，生成的动作序列会遗漏关键信息。解决方法：截图时同步记录时间戳，或在图片上叠加文字水印（可以用 Pillow 实现）：
+
+```python
+from PIL import Image, ImageDraw, ImageFont
+
+def add_timestamp_overlay(image_path: str, timestamp: str, output_path: str) -> None:
+    img = Image.open(image_path).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    # 在左上角叠加半透明时间戳
+    draw.rectangle([0, 0, 300, 30], fill=(0, 0, 0, 128))
+    draw.text((5, 5), timestamp, fill=(255, 255, 255, 255))
+    img.convert("RGB").save(output_path)
+```
+
+**坑 3：截图中含有敏感信息（PII）**
+
+用户会话截图往往包含姓名、手机号、邮箱、地址等个人信息。在发送给 API 前，必须进行脱敏处理。可以先用 OCR 定位敏感区域，再用矩形遮盖：
+
+```python
+from PIL import Image, ImageDraw
+
+def redact_region(image_path: str, regions: list[tuple[int, int, int, int]], output_path: str) -> None:
+    """regions: [(x1, y1, x2, y2), ...]"""
+    img = Image.open(image_path)
+    draw = ImageDraw.Draw(img)
+    for region in regions:
+        draw.rectangle(region, fill=(0, 0, 0))
+    img.save(output_path)
+```
+
+对于自动化流程，可以结合 presidio 或其他 PII 检测库先扫描截图再决定是否脱敏。

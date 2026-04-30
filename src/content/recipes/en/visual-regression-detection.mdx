@@ -1,0 +1,279 @@
+---
+title: Visual Regression Testing with VLMs
+description: Use a VLM in your CI/CD pipeline to review before/after screenshots of frontend deploys and automatically flag layout breaks, missing elements, and style regressions.
+category: multi-image
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your CI/CD pipeline captures screenshots before and after a frontend deploy. A VLM reviews the pairs and flags visual regressions:
+
+- **Layout breaks**: overlapping elements, misalignment, content overflowing containers
+- **Missing elements**: buttons disappeared, images failing to load, components not rendered
+- **Style changes**: wrong font sizes, incorrect colors, unexpected spacing
+- **Responsive issues**: mobile layout broken at a certain breakpoint
+
+VLMs don't replace pixel-diff tools (Percy, Playwright visual diff). They complement them at the semantic layer: pixel tools tell you "there's a difference," VLMs tell you "whether the difference affects the user experience" — with severity ratings.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best overall; accurate UI detail recognition; stable JSON output |
+| **Claude 3.5 Sonnet** | More precise severity classification; lower false-positive rate |
+
+Start with GPT-4o. If false-positive rates are too high for your codebase, switch to Claude 3.5 Sonnet.
+
+## Prompt Template
+
+```text
+You are a frontend visual regression testing expert. You will receive two screenshots: the first is BEFORE the deploy, the second is AFTER.
+Analyze for visual regressions and return ONLY the following JSON — no explanation, no markdown.
+
+Severity definitions:
+- critical: Functional breakage (button missing, form unusable, content obscured)
+- warning: Visual anomaly that doesn't break core function (wrong color, font size change, spacing drift)
+- info: Minor cosmetic difference (border thickness, shadow change)
+
+Rules:
+- Ignore dynamic content regions (timestamps, live data, ads, randomized recommendations)
+- Only report changes related to UI structure and styles
+- If no regressions found, return an empty regressions array and set passed to true
+
+{
+  "passed": true | false,
+  "summary": "One sentence summarizing the test result",
+  "regressions": [
+    {
+      "id": "Unique identifier (e.g. NAV-001)",
+      "severity": "critical" | "warning" | "info",
+      "component": "Affected component or region",
+      "description": "Description of the issue",
+      "before": "State before deploy",
+      "after": "State after deploy",
+      "suggested_fix": "Optional fix suggestion"
+    }
+  ]
+}
+```
+
+## Code
+
+```python
+import base64
+import json
+import sys
+from pathlib import Path
+from dataclasses import dataclass
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are a frontend visual regression testing expert. Output JSON only — no explanation, no markdown."
+
+VRT_PROMPT = """You are a frontend visual regression testing expert. You will receive two screenshots: the first is BEFORE the deploy, the second is AFTER.
+Analyze for visual regressions and return ONLY the following JSON — no explanation, no markdown.
+
+Severity definitions:
+- critical: Functional breakage (button missing, form unusable, content obscured)
+- warning: Visual anomaly that doesn't break core function (wrong color, font size change, spacing drift)
+- info: Minor cosmetic difference (border thickness, shadow change)
+
+Rules:
+- Ignore dynamic content regions (timestamps, live data, ads, randomized recommendations)
+- Only report changes related to UI structure and styles
+- If no regressions found, return an empty regressions array and set passed to true
+
+{
+  "passed": true | false,
+  "summary": "One sentence summarizing the test result",
+  "regressions": [
+    {
+      "id": "Unique identifier (e.g. NAV-001)",
+      "severity": "critical" | "warning" | "info",
+      "component": "Affected component or region",
+      "description": "Description of the issue",
+      "before": "State before deploy",
+      "after": "State after deploy",
+      "suggested_fix": "Optional fix suggestion"
+    }
+  ]
+}"""
+
+
+@dataclass
+class VRTResult:
+    passed: bool
+    summary: str
+    regressions: list[dict]
+    raw: dict
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def run_visual_regression_test(
+    before_path: str,
+    after_path: str,
+    viewport: str = "desktop",
+) -> VRTResult:
+    """
+    Compare before/after screenshots and return a visual regression report.
+
+    Args:
+        before_path: Path to the pre-deploy screenshot.
+        after_path: Path to the post-deploy screenshot.
+        viewport: Viewport label for logging ("desktop" or "mobile").
+    """
+    before_data, before_mime = encode_image(before_path)
+    after_data, after_mime = encode_image(after_path)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"[Viewport: {viewport}] [BEFORE DEPLOY]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{before_mime};base64,{before_data}"}},
+                    {"type": "text", "text": f"[Viewport: {viewport}] [AFTER DEPLOY]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{after_mime};base64,{after_data}"}},
+                    {"type": "text", "text": VRT_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    raw = json.loads(response.choices[0].message.content)
+    return VRTResult(
+        passed=raw.get("passed", True),
+        summary=raw.get("summary", ""),
+        regressions=raw.get("regressions", []),
+        raw=raw,
+    )
+
+
+def run_multi_viewport_vrt(page_name: str, viewport_screenshots: dict[str, tuple[str, str]]) -> dict:
+    """
+    Run VRT separately for each viewport. Never mix viewport sizes in one call.
+
+    Args:
+        page_name: Page name for the report header.
+        viewport_screenshots: {"desktop": ("before.png", "after.png"), "mobile": ("before_m.png", "after_m.png")}
+    """
+    results = {}
+    for viewport, (before, after) in viewport_screenshots.items():
+        print(f"Testing {page_name} - {viewport}...")
+        result = run_visual_regression_test(before, after, viewport=viewport)
+        results[viewport] = {
+            "passed": result.passed,
+            "summary": result.summary,
+            "regression_count": len(result.regressions),
+            "critical_count": sum(1 for r in result.regressions if r.get("severity") == "critical"),
+            "regressions": result.regressions,
+        }
+
+    overall_passed = all(r["passed"] for r in results.values())
+    return {"page": page_name, "overall_passed": overall_passed, "viewports": results}
+
+
+if __name__ == "__main__":
+    report = run_multi_viewport_vrt(
+        page_name="homepage",
+        viewport_screenshots={
+            "desktop": ("homepage_before_desktop.png", "homepage_after_desktop.png"),
+            "mobile": ("homepage_before_mobile.png", "homepage_after_mobile.png"),
+        },
+    )
+    print(json.dumps(report, indent=2))
+
+    # CI exit code: fail if any critical regressions found
+    has_critical = any(vp["critical_count"] > 0 for vp in report["viewports"].values())
+    sys.exit(1 if has_critical else 0)
+```
+
+Run:
+
+```bash
+pip install openai
+python visual_regression.py
+echo "Exit code: $?"
+```
+
+Expected output:
+
+```json
+{
+  "page": "homepage",
+  "overall_passed": false,
+  "viewports": {
+    "desktop": {
+      "passed": false,
+      "summary": "Navbar layout broken on desktop; primary CTA button is obscured",
+      "regression_count": 2,
+      "critical_count": 1,
+      "regressions": [
+        {
+          "id": "NAV-001",
+          "severity": "critical",
+          "component": "Top navigation bar",
+          "description": "The 'Buy Now' button is covered by the dropdown menu and cannot be clicked",
+          "before": "Button fully visible, z-index correct",
+          "after": "Button obscured by nav dropdown overlay",
+          "suggested_fix": "Audit z-index on the nav dropdown — it should not exceed the CTA button layer"
+        },
+        {
+          "id": "FONT-002",
+          "severity": "warning",
+          "component": "Page heading",
+          "description": "Heading font size changed from 32px to 28px",
+          "before": "font-size: 32px",
+          "after": "font-size: 28px",
+          "suggested_fix": "Check for a global CSS rule that overrides heading styles"
+        }
+      ]
+    },
+    "mobile": {
+      "passed": true,
+      "summary": "No visual regressions detected on mobile",
+      "regression_count": 0,
+      "critical_count": 0,
+      "regressions": []
+    }
+  }
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Dynamic content causes false positives**
+
+Timestamps, live prices, carousel frames, and user avatars differ between screenshots taken at different times. The VLM dutifully reports these as "content changed." Fix: explicitly list dynamic content types to ignore in the prompt, or mock them to static values before capturing screenshots:
+
+```python
+# Playwright example: freeze dynamic content before screenshotting
+# await page.evaluate("document.querySelector('.timestamp').textContent = '2024-01-01 00:00:00'")
+# await page.evaluate("document.querySelector('.live-price').textContent = '$100.00'")
+```
+
+**Gotcha 2: VLM output is subjective — severity ratings are inconsistent across calls**
+
+Without explicit severity definitions, the same issue might be rated "critical" in one run and "warning" in the next — making your CI pipeline unreliable. Fix: define severity levels precisely in the prompt (as in the template above). Enforce them in code: hard-fail on `critical`, log-only for `warning`/`info`.
+
+**Gotcha 3: Mixing desktop and mobile screenshots in one API call produces noise**
+
+Desktop and mobile layouts differ dramatically by design. If you pass a desktop screenshot and a mobile screenshot to the model as a before/after pair, it will report responsive design differences as regressions. Always run separate VRT calls per viewport, as shown in `run_multi_viewport_vrt` — never mix viewport sizes in a single comparison.

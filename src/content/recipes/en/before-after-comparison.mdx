@@ -1,0 +1,177 @@
+---
+title: Before and After Image Comparison
+description: Have your agent compare two versions of an image and output a structured diff of what was added, removed, or modified.
+category: multi-image
+lang: en
+models:
+  - GPT-4o
+  - Gemini 1.5 Pro
+  - Claude 3.5 Sonnet
+difficulty: beginner
+date: 2026-04-30
+author: vlm.md
+---
+
+## Scenario
+
+Your agent needs to compare two versions of the same subject and produce a change report:
+
+- **UI screenshots**: page screenshots before and after a frontend deploy — find layout, text, and color changes
+- **Product photos**: product images before and after editing — detect crops, color grading, watermarks
+- **Annotated documents**: a PDF before and after review — identify new comments, deleted paragraphs, edits
+
+The goal is semantic-level changes — not pixel diffs.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Best all-rounder; accurate UI change descriptions; stable JSON output |
+| **Gemini 1.5 Pro** | Strong visual detail perception; good for product photo comparison |
+| **Claude 3.5 Sonnet** | Highest structured output quality; most precise change categorization |
+
+GPT-4o or Claude 3.5 Sonnet are the safest choices for reliable structured diff output.
+
+## Prompt Template
+
+```text
+You will receive two images: the first is the BEFORE state, the second is the AFTER state.
+Analyze the semantic differences between the two images and return ONLY the following JSON — no explanation, no markdown.
+
+{
+  "summary": "One sentence summarizing the changes",
+  "changes": [
+    {
+      "type": "added" | "removed" | "modified",
+      "element": "Name or location of the changed element",
+      "before": "State before the change (null if not applicable)",
+      "after": "State after the change (null if not applicable)",
+      "severity": "critical" | "warning" | "info"
+    }
+  ]
+}
+
+Rules:
+- Ignore sub-pixel rendering differences (anti-aliasing, font hinting)
+- Only report changes a human user would notice
+- If the images are identical, return an empty changes array
+```
+
+## Code
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "You are an image diff analyst. Output JSON only — no explanation, no markdown."
+
+DIFF_PROMPT = """You will receive two images: the first is the BEFORE state, the second is the AFTER state.
+Analyze the semantic differences between the two images and return ONLY the following JSON — no explanation, no markdown.
+
+{
+  "summary": "One sentence summarizing the changes",
+  "changes": [
+    {
+      "type": "added | removed | modified",
+      "element": "Name or location of the changed element",
+      "before": "State before the change (null if not applicable)",
+      "after": "State after the change (null if not applicable)",
+      "severity": "critical | warning | info"
+    }
+  ]
+}
+
+Rules:
+- Ignore sub-pixel rendering differences (anti-aliasing, font hinting)
+- Only report changes a human user would notice
+- If the images are identical, return an empty changes array"""
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    """Returns (base64_data, mime_type)."""
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def compare_images(before_path: str, after_path: str) -> dict:
+    before_data, before_mime = encode_image(before_path)
+    after_data, after_mime = encode_image(after_path)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    # Explicitly label each image to prevent before/after confusion
+                    {"type": "text", "text": "[BEFORE IMAGE]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{before_mime};base64,{before_data}"}},
+                    {"type": "text", "text": "[AFTER IMAGE]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{after_mime};base64,{after_data}"}},
+                    {"type": "text", "text": DIFF_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+if __name__ == "__main__":
+    result = compare_images("screenshot_before.png", "screenshot_after.png")
+    print(json.dumps(result, indent=2))
+```
+
+Run:
+
+```bash
+pip install openai
+python compare_images.py
+```
+
+Expected output:
+
+```json
+{
+  "summary": "A 'Help' button was added to the navbar; the main heading color changed from blue to dark gray",
+  "changes": [
+    {
+      "type": "added",
+      "element": "Navbar - Help button",
+      "before": null,
+      "after": "Text link 'Help' added to the top-right corner",
+      "severity": "info"
+    },
+    {
+      "type": "modified",
+      "element": "Main heading text color",
+      "before": "#1a73e8 (blue)",
+      "after": "#333333 (dark gray)",
+      "severity": "warning"
+    }
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: "What's different?" is too vague — output is all over the place**
+
+Asking the model "what's different about these two images?" without structure produces noise: lighting differences, compression artifacts, font rendering subtleties. Fix: provide an explicit output schema with `type` (added/removed/modified) and `severity` fields. Structured schemas force the model into useful, categorized output.
+
+**Gotcha 2: Image order is ambiguous — before and after get swapped**
+
+In multi-image API calls, models sometimes lose track of which image is "before" and which is "after." Always add explicit text labels immediately before each image (`[BEFORE IMAGE]` / `[AFTER IMAGE]`) rather than relying on list position alone.
+
+**Gotcha 3: Anti-aliasing and font hinting cause false positives**
+
+Screenshots of the same page taken on different OSes or display densities differ at the sub-pixel level — font rendering varies slightly. VLMs may report this as "text style changed." Explicitly instruct the model to ignore sub-pixel rendering differences and report only user-perceptible semantic changes to eliminate this noise.

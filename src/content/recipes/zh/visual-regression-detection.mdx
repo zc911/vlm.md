@@ -1,0 +1,281 @@
+---
+title: 视觉回归测试
+description: 在 CI/CD 流水线中用 VLM 审查前端部署前后的截图，自动标记布局崩溃、样式变化等视觉回归问题。
+category: multi-image
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-04-30
+author: vlm.md
+---
+
+## 场景
+
+CI/CD 流水线在前端部署前后自动截图，VLM 对比两组截图并标记视觉回归问题：
+
+- **布局崩溃**：元素重叠、错位、溢出容器
+- **缺失元素**：按钮消失、图片加载失败、模块未渲染
+- **样式变化**：字体大小异常、颜色错误、间距变化
+- **响应式问题**：移动端布局在某断点下异常
+
+VLM 不替代像素对比工具（如 Percy、Playwright visual diff），而是作为**语义层补充**：像素工具告诉你"有差异"，VLM 告诉你"差异是否影响用户体验"，并给出严重程度分级。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 首选，对 UI 细节识别准确，JSON 输出格式稳定 |
+| **Claude 3.5 Sonnet** | 严重程度分级更精准，误报率低 |
+
+两个模型都表现优秀，推荐优先使用 GPT-4o，如果误报率偏高再切换到 Claude 3.5 Sonnet。
+
+## Prompt 模板
+
+```text
+你是一个前端视觉回归测试专家。你将收到两张截图：第一张是「部署前」，第二张是「部署后」。
+请分析视觉回归问题并严格按以下 JSON 格式输出，不要有任何多余文字。
+
+严重程度定义：
+- critical: 功能性损坏（按钮消失、表单无法操作、内容被遮挡）
+- warning: 视觉异常但不影响核心功能（颜色错误、字体大小变化、间距偏差）
+- info: 轻微差异（边框粗细、阴影变化）
+
+注意事项：
+- 忽略动态内容区域（时间戳、实时数据、广告位、随机推荐）
+- 只报告与 UI 结构和样式相关的变化
+- 如果没有发现视觉回归，regressions 返回空数组，passed 为 true
+
+{
+  "passed": true | false,
+  "summary": "一句话总结测试结果",
+  "regressions": [
+    {
+      "id": "唯一标识符（如 NAV-001）",
+      "severity": "critical" | "warning" | "info",
+      "component": "受影响的组件或区域",
+      "description": "问题描述",
+      "before": "部署前的状态",
+      "after": "部署后的状态",
+      "suggested_fix": "修复建议（可选）"
+    }
+  ]
+}
+```
+
+## 代码示例
+
+```python
+import base64
+import json
+from pathlib import Path
+from openai import OpenAI
+from dataclasses import dataclass
+
+client = OpenAI()
+
+SYSTEM_PROMPT = "你是前端视觉回归测试专家，只输出 JSON，不输出任何其他内容。"
+
+VRT_PROMPT = """你是一个前端视觉回归测试专家。你将收到两张截图：第一张是「部署前」，第二张是「部署后」。
+请分析视觉回归问题并严格按以下 JSON 格式输出，不要有任何多余文字。
+
+严重程度定义：
+- critical: 功能性损坏（按钮消失、表单无法操作、内容被遮挡）
+- warning: 视觉异常但不影响核心功能（颜色错误、字体大小变化、间距偏差）
+- info: 轻微差异（边框粗细、阴影变化）
+
+注意事项：
+- 忽略动态内容区域（时间戳、实时数据、广告位、随机推荐）
+- 只报告与 UI 结构和样式相关的变化
+- 如果没有发现视觉回归，regressions 返回空数组，passed 为 true
+
+{
+  "passed": true | false,
+  "summary": "一句话总结测试结果",
+  "regressions": [
+    {
+      "id": "唯一标识符（如 NAV-001）",
+      "severity": "critical" | "warning" | "info",
+      "component": "受影响的组件或区域",
+      "description": "问题描述",
+      "before": "部署前的状态",
+      "after": "部署后的状态",
+      "suggested_fix": "修复建议（可选）"
+    }
+  ]
+}"""
+
+
+@dataclass
+class VRTResult:
+    passed: bool
+    summary: str
+    regressions: list[dict]
+    raw: dict
+
+
+def encode_image(path: str) -> tuple[str, str]:
+    suffix = Path(path).suffix.lower().lstrip(".")
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}.get(suffix, "image/jpeg")
+    data = base64.b64encode(Path(path).read_bytes()).decode()
+    return data, mime
+
+
+def run_visual_regression_test(
+    before_path: str,
+    after_path: str,
+    viewport: str = "desktop",
+) -> VRTResult:
+    """
+    对比部署前后截图，返回视觉回归报告。
+
+    Args:
+        before_path: 部署前截图路径
+        after_path: 部署后截图路径
+        viewport: 视口类型，仅用于日志标记（"desktop" 或 "mobile"）
+    """
+    before_data, before_mime = encode_image(before_path)
+    after_data, after_mime = encode_image(after_path)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"[视口: {viewport}] [部署前截图]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{before_mime};base64,{before_data}"}},
+                    {"type": "text", "text": f"[视口: {viewport}] [部署后截图]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{after_mime};base64,{after_data}"}},
+                    {"type": "text", "text": VRT_PROMPT},
+                ],
+            },
+        ],
+        max_tokens=1024,
+    )
+
+    raw = json.loads(response.choices[0].message.content)
+    return VRTResult(
+        passed=raw.get("passed", True),
+        summary=raw.get("summary", ""),
+        regressions=raw.get("regressions", []),
+        raw=raw,
+    )
+
+
+def run_multi_viewport_vrt(page_name: str, viewport_screenshots: dict[str, tuple[str, str]]) -> dict:
+    """
+    对多个视口分别运行视觉回归测试。
+
+    Args:
+        page_name: 页面名称（用于报告标题）
+        viewport_screenshots: {"desktop": ("before.png", "after.png"), "mobile": ("before_m.png", "after_m.png")}
+    """
+    results = {}
+    for viewport, (before, after) in viewport_screenshots.items():
+        print(f"正在测试 {page_name} - {viewport}...")
+        result = run_visual_regression_test(before, after, viewport=viewport)
+        results[viewport] = {
+            "passed": result.passed,
+            "summary": result.summary,
+            "regression_count": len(result.regressions),
+            "critical_count": sum(1 for r in result.regressions if r.get("severity") == "critical"),
+            "regressions": result.regressions,
+        }
+
+    overall_passed = all(r["passed"] for r in results.values())
+    return {"page": page_name, "overall_passed": overall_passed, "viewports": results}
+
+
+if __name__ == "__main__":
+    report = run_multi_viewport_vrt(
+        page_name="homepage",
+        viewport_screenshots={
+            "desktop": ("homepage_before_desktop.png", "homepage_after_desktop.png"),
+            "mobile": ("homepage_before_mobile.png", "homepage_after_mobile.png"),
+        },
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    # CI 退出码：有 critical 问题则失败
+    import sys
+    has_critical = any(
+        vp["critical_count"] > 0 for vp in report["viewports"].values()
+    )
+    sys.exit(1 if has_critical else 0)
+```
+
+运行：
+
+```bash
+pip install openai
+python visual_regression.py
+echo "Exit code: $?"
+```
+
+预期输出：
+
+```json
+{
+  "page": "homepage",
+  "overall_passed": false,
+  "viewports": {
+    "desktop": {
+      "passed": false,
+      "summary": "导航栏在桌面端出现布局崩溃，主 CTA 按钮被遮挡",
+      "regression_count": 2,
+      "critical_count": 1,
+      "regressions": [
+        {
+          "id": "NAV-001",
+          "severity": "critical",
+          "component": "顶部导航栏",
+          "description": "「立即购买」按钮被下拉菜单遮挡，用户无法点击",
+          "before": "按钮完全可见，z-index 正常",
+          "after": "按钮被导航下拉菜单覆盖",
+          "suggested_fix": "检查导航下拉菜单的 z-index，确保不超过 CTA 按钮层级"
+        },
+        {
+          "id": "FONT-002",
+          "severity": "warning",
+          "component": "页面标题",
+          "description": "标题字体大小从 32px 变为 28px",
+          "before": "font-size: 32px",
+          "after": "font-size: 28px",
+          "suggested_fix": "检查是否有全局 CSS 覆盖了标题样式"
+        }
+      ]
+    },
+    "mobile": {
+      "passed": true,
+      "summary": "移动端未发现视觉回归",
+      "regression_count": 0,
+      "critical_count": 0,
+      "regressions": []
+    }
+  }
+}
+```
+
+## 踩坑记录
+
+**坑 1：动态内容导致大量误报**
+
+页面中的时间戳、实时价格、轮播图当前帧、用户头像等内容在每次截图时都不同，VLM 会将这些差异报告为"内容变化"。解决方法：在 prompt 中明确列出要忽略的动态区域类型，或在截图前用测试工具（如 Playwright）将动态内容替换为固定的 mock 数据。
+
+```python
+# Playwright 示例：截图前 mock 动态内容
+# await page.evaluate("document.querySelector('.timestamp').textContent = '2024-01-01 00:00:00'")
+# await page.evaluate("document.querySelector('.live-price').textContent = '$100.00'")
+```
+
+**坑 2：VLM 输出主观，缺少统一的严重程度标准**
+
+不同调用对同一问题可能给出不同的 severity，造成 CI 结果不稳定。解决方法：在 prompt 中给出**明确的严重程度定义**（如上面模板所示），并在代码层面对 critical 问题执行硬性失败，对 warning/info 只记录不阻断流水线。
+
+**坑 3：桌面端和移动端截图混在一起分析**
+
+不同视口下的页面布局差异本身就很大，如果把桌面端和移动端截图放在同一次 API 调用中，模型会产生混乱，把响应式布局差异误判为回归问题。必须**按视口分开调用**，如 `run_multi_viewport_vrt` 函数所示，每个视口单独对比。
