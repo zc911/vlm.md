@@ -1,0 +1,195 @@
+---
+title: Parse Medical Lab Report Images
+description: Extract test item names, values, units, reference ranges, and abnormal flags from blood work and biochemistry report photos — structured output for health management agents.
+category: document-understanding
+lang: en
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-05-13
+author: vlm.md
+---
+
+## Scenario
+
+Your health management agent processes lab report photos uploaded by users and extracts:
+
+- Each test item's name, measured value, and unit
+- Reference range (normal interval)
+- Abnormal flag (high ↑ / low ↓ / critical)
+- Report date and ordering department
+
+The structured output feeds into trend analysis, anomaly alerts, or summary generation for doctor consultations.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **GPT-4o** | Strongest table recognition; highest accuracy on CBC and metabolic panel formats |
+| **Claude 3.5 Sonnet** | Better semantic handling of abnormal markers; more reliable on unusual symbols like "↑↑" or "HH" |
+
+Gemini is not recommended here — it underperforms on medical abbreviations (ALT, AST, eGFR, etc.) compared to the other two.
+
+## Prompt Template
+
+```text
+You are a medical lab report parsing expert. Extract test results from the image and return JSON in this exact format:
+
+{
+  "report_date": "YYYY-MM-DD, or null if not found",
+  "department": "Ordering department name, or null",
+  "items": [
+    {
+      "name": "Test item name exactly as printed",
+      "value": "Measured value (string)",
+      "unit": "Unit string",
+      "reference_range": "Reference range as printed, e.g. 3.5-5.5",
+      "flag": "abnormal_high | abnormal_low | critical | normal"
+    }
+  ]
+}
+
+Rules:
+- Preserve original item names — do not translate or abbreviate
+- Keep value as a string to preserve original precision
+- Set flag ONLY based on markers explicitly shown in the image (H/L, ↑↓, *, bold, red text, etc.)
+- Do NOT calculate flags by comparing value to reference range yourself
+```
+
+## Code
+
+```python
+import anthropic
+import base64
+import json
+import re
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+PROMPT = """You are a medical lab report parsing expert. Extract test results from the image and return JSON in this exact format:
+
+{
+  "report_date": "YYYY-MM-DD, or null",
+  "department": "Ordering department, or null",
+  "items": [
+    {
+      "name": "Test item name exactly as printed",
+      "value": "Measured value (string)",
+      "unit": "Unit",
+      "reference_range": "Reference range as printed",
+      "flag": "abnormal_high | abnormal_low | critical | normal"
+    }
+  ]
+}
+
+Preserve original item names. Set flag ONLY based on markers explicitly shown in the image — do not calculate from values."""
+
+
+def parse_report(image_path: str) -> dict:
+    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    message = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ],
+    )
+
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+def get_abnormal_items(report: dict) -> list[dict]:
+    return [
+        item for item in report.get("items", [])
+        if item.get("flag") in ("abnormal_high", "abnormal_low", "critical")
+    ]
+
+
+if __name__ == "__main__":
+    report = parse_report("blood_test.jpg")
+    print(json.dumps(report, indent=2))
+
+    abnormal = get_abnormal_items(report)
+    if abnormal:
+        flag_labels = {
+            "abnormal_high": "HIGH ↑",
+            "abnormal_low": "LOW ↓",
+            "critical": "CRITICAL ‼️",
+        }
+        print(f"\n⚠️  {len(abnormal)} abnormal result(s):")
+        for item in abnormal:
+            label = flag_labels[item["flag"]]
+            print(f"  {item['name']}: {item['value']} {item['unit']} [{label}]")
+```
+
+Expected output:
+
+```json
+{
+  "report_date": "2024-03-15",
+  "department": "Internal Medicine",
+  "items": [
+    {
+      "name": "WBC",
+      "value": "10.8",
+      "unit": "10^9/L",
+      "reference_range": "3.5-9.5",
+      "flag": "abnormal_high"
+    },
+    {
+      "name": "HGB",
+      "value": "135",
+      "unit": "g/L",
+      "reference_range": "130-175",
+      "flag": "normal"
+    },
+    {
+      "name": "PLT",
+      "value": "98",
+      "unit": "10^9/L",
+      "reference_range": "125-350",
+      "flag": "abnormal_low"
+    }
+  ]
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Never let the model calculate flags**
+
+An early prompt asked the model to "determine if the value is abnormal based on the reference range." It would occasionally flag boundary values (exactly at the upper limit) as abnormal. The correct approach: only extract flags that are explicitly marked in the image (H/L, ↑↓, asterisk, bold, red text). Let the image's own markers be the ground truth.
+
+**Gotcha 2: Phone photos have perspective distortion**
+
+Lab reports are printed on portrait A4. A phone photo taken at an angle introduces trapezoidal distortion that misaligns table columns — the model associates values with the wrong units or reference ranges. Prompt users to "hold the phone directly above the report, parallel to the page," or apply perspective correction client-side before uploading.
+
+**Gotcha 3: Flag notation varies by hospital**
+
+One hospital uses H/L, another uses ↑↓, another uses asterisks (*), and some use bold or red text (visible as color variation in the photo). Add this line to your prompt:
+
+```
+"Abnormal markers in the image may appear as H/L, ↑↓, *, bold text, or color differences. Map all of them to the appropriate flag value."
+```
+
+**Gotcha 4: max_tokens too low truncates results**
+
+A CBC has 20+ items; a comprehensive metabolic panel can have 40+. With `max_tokens=512` the model truncates mid-JSON, causing a parse error. Set at least 2048. For full panels, use 4096.

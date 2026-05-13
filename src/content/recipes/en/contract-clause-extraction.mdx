@@ -1,0 +1,165 @@
+---
+title: Extract Key Clauses from Contract Images
+description: Have your agent automatically extract parties, amounts, dates, penalty clauses, and jurisdiction from scanned contracts and output structured JSON for approval workflows or risk systems.
+category: document-understanding
+lang: en
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-05-13
+author: vlm.md
+---
+
+## Scenario
+
+Your agent processes contract scans uploaded by legal or procurement teams and automatically extracts:
+
+- Party A and Party B full names
+- Contract amount and currency
+- Signing date, effective date, expiry date
+- Main performance obligations (brief summary)
+- Penalty clause (if present)
+- Governing court or arbitration body
+
+Extracted data flows into approval systems or contract registers — humans only review flagged anomalies.
+
+## Recommended Models
+
+| Model | When to use |
+|---|---|
+| **Claude 3.5 Sonnet** | Best long-document understanding; cleanest clause boundary detection — first choice |
+| **GPT-4o** | Strong on mixed-language contracts; fast; good for batch processing |
+| **Gemini 1.5 Pro** | Best value for very long contracts (20+ pages) with 1M context |
+
+Contracts are dense and format-variable. Claude's long-context comprehension is the most consistent of the three.
+
+## Prompt Template
+
+```text
+You are a contract information extraction expert. Extract the following fields from the image and return ONLY valid JSON — no explanation, no markdown.
+
+Fields:
+- party_a: Full legal name of Party A (the side labeled "Party A" or "Client" in the contract)
+- party_b: Full legal name of Party B
+- contract_amount: Total contract value (number, no currency symbol; use the total price if multiple amounts appear)
+- currency: Currency code (USD / EUR / CNY etc.)
+- signing_date: Date signed (YYYY-MM-DD, or null)
+- effective_date: Date the contract takes effect (YYYY-MM-DD; if not stated, same as signing_date)
+- expiry_date: Contract end or termination date (YYYY-MM-DD, or null)
+- obligations_summary: Party B's main obligations, max 60 words
+- penalty_clause: Verbatim excerpt of the penalty/liquidated damages clause, max 60 words; null if absent
+- jurisdiction: Name of governing court or arbitration body; null if absent
+
+Return null for any field not found. Do not guess or infer.
+```
+
+## Code
+
+```python
+import anthropic
+import base64
+import json
+import re
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+PROMPT = """You are a contract information extraction expert. Extract the following fields from the image and return ONLY valid JSON — no explanation, no markdown.
+
+Fields:
+- party_a: Full legal name of Party A
+- party_b: Full legal name of Party B
+- contract_amount: Total contract value (number, no currency symbol)
+- currency: Currency code
+- signing_date: Date signed (YYYY-MM-DD)
+- effective_date: Effective date (YYYY-MM-DD)
+- expiry_date: Expiry date (YYYY-MM-DD)
+- obligations_summary: Party B's main obligations, max 60 words
+- penalty_clause: Penalty/liquidated damages excerpt, max 60 words; null if absent
+- jurisdiction: Governing court or arbitration body; null if absent
+
+Return null for any field not found. Do not guess."""
+
+
+def extract_contract(image_path: str) -> dict:
+    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    message = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ],
+    )
+
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+if __name__ == "__main__":
+    result = extract_contract("contract.jpg")
+    print(json.dumps(result, indent=2))
+```
+
+Expected output:
+
+```json
+{
+  "party_a": "Acme Technologies Inc.",
+  "party_b": "CloudServ Solutions LLC",
+  "contract_amount": 240000,
+  "currency": "USD",
+  "signing_date": "2024-03-01",
+  "effective_date": "2024-03-01",
+  "expiry_date": "2025-02-28",
+  "obligations_summary": "Party B shall complete system deployment within 30 days of contract execution and provide 12 months of maintenance support.",
+  "penalty_clause": "For each day of delay beyond the agreed delivery date, Party B shall pay liquidated damages equal to 0.1% of the total contract value, not to exceed 10%.",
+  "jurisdiction": "Superior Court of California, County of San Francisco"
+}
+```
+
+## Gotchas
+
+**Gotcha 1: Party A/B role confusion**
+
+In some contracts "Party A" is the buyer, in others it's the service provider. The model sometimes swaps them based on assumed roles. Fix: add "Identify Party A strictly by the label 'Party A' in the contract text — do not infer from context."
+
+**Gotcha 2: Multiple amounts — wrong one extracted**
+
+Contracts often list deposit, milestone payments, and total value. Without explicit guidance the model may return any of these. Add: "Use the total contract value. If not explicitly labeled as total, sum all payment amounts."
+
+**Gotcha 3: Low-resolution scans miss fine print**
+
+Penalty clauses and jurisdiction sections are often in small print (8–10pt). Scans below 150 DPI cause the model to miss or misread these. Check resolution before sending:
+
+```python
+from PIL import Image
+
+def check_dpi(path: str) -> int:
+    with Image.open(path) as img:
+        dpi = img.info.get("dpi", (72, 72))
+        return int(dpi[0])
+
+if check_dpi("contract.jpg") < 150:
+    print("Warning: low scan resolution — extraction may be inaccurate")
+```
+
+**Gotcha 4: Key clauses are on the last pages**
+
+Penalty and jurisdiction clauses almost always appear in the final pages of a contract. If you only send the first page, these fields return null. For multi-page contracts, merge all pages into one request or extract page-by-page and merge results (prefer non-null values).

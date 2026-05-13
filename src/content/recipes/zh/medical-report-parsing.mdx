@@ -1,0 +1,194 @@
+---
+title: 解析医疗检验报告图片
+description: 从血常规、生化等检验报告图片中提取指标名称、数值、参考范围和异常标记，结构化输出供健康管理 agent 使用。
+category: document-understanding
+lang: zh
+models:
+  - GPT-4o
+  - Claude 3.5 Sonnet
+difficulty: intermediate
+date: 2026-05-13
+author: vlm.md
+---
+
+## 场景
+
+你的健康管理 agent 需要处理用户上传的检验报告图片（医院打印件拍照），提取：
+
+- 每个检验指标的名称、数值、单位
+- 参考范围（正常值区间）
+- 异常标记（偏高 ↑ / 偏低 ↓ / 危急值）
+- 报告日期和送检科室
+
+提取结果用于趋势分析、异常提醒或与医生沟通时的摘要生成。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **GPT-4o** | 表格识别最强，血常规、生化报告格式识别准确率高 |
+| **Claude 3.5 Sonnet** | 对异常标记语义理解好，"↑↑"（极度偏高）等特殊符号处理更稳 |
+
+不推荐 Gemini 用于此场景——医疗专业术语的中文缩写（ALT、AST、Cr 等）识别率低于前两者。
+
+## Prompt 模板
+
+```text
+你是一个医疗检验报告解析专家。请从图片中提取检验结果，以 JSON 格式返回。
+
+返回格式：
+{
+  "report_date": "YYYY-MM-DD 格式的报告日期，如无则 null",
+  "department": "送检科室，如无则 null",
+  "items": [
+    {
+      "name": "指标名称（使用图片中的原始名称）",
+      "value": "检测数值（字符串）",
+      "unit": "单位",
+      "reference_range": "参考范围原文，如 3.5-5.5",
+      "flag": "abnormal_high（偏高）/ abnormal_low（偏低）/ critical（危急值）/ normal（正常）"
+    }
+  ]
+}
+
+注意：
+- 保留原始指标名称，不要翻译或缩写
+- 数值保持字符串格式（保留原始精度）
+- flag 仅根据图片中明确标注的异常符号判断，不要自行计算
+```
+
+## 代码示例
+
+```python
+import anthropic
+import base64
+import json
+import re
+from pathlib import Path
+from dataclasses import dataclass
+
+client = anthropic.Anthropic()
+
+PROMPT = """你是一个医疗检验报告解析专家。请从图片中提取检验结果，以 JSON 格式返回。
+
+返回格式：
+{
+  "report_date": "YYYY-MM-DD，如无则 null",
+  "department": "送检科室，如无则 null",
+  "items": [
+    {
+      "name": "指标名称",
+      "value": "数值（字符串）",
+      "unit": "单位",
+      "reference_range": "参考范围",
+      "flag": "abnormal_high / abnormal_low / critical / normal"
+    }
+  ]
+}
+
+保留原始指标名称，不要翻译。flag 仅根据图片中明确标注的异常符号判断。"""
+
+
+def parse_report(image_path: str) -> dict:
+    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    message = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ],
+    )
+
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+def get_abnormal_items(report: dict) -> list[dict]:
+    """筛选出所有异常指标"""
+    return [
+        item for item in report.get("items", [])
+        if item.get("flag") in ("abnormal_high", "abnormal_low", "critical")
+    ]
+
+
+if __name__ == "__main__":
+    report = parse_report("blood_test.jpg")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    abnormal = get_abnormal_items(report)
+    if abnormal:
+        print(f"\n⚠️ 发现 {len(abnormal)} 项异常：")
+        for item in abnormal:
+            flag_label = {"abnormal_high": "偏高↑", "abnormal_low": "偏低↓", "critical": "危急值‼️"}[item["flag"]]
+            print(f"  {item['name']}: {item['value']} {item['unit']} [{flag_label}]")
+```
+
+预期输出：
+
+```json
+{
+  "report_date": "2024-03-15",
+  "department": "内科",
+  "items": [
+    {
+      "name": "白细胞计数(WBC)",
+      "value": "10.8",
+      "unit": "10^9/L",
+      "reference_range": "3.5-9.5",
+      "flag": "abnormal_high"
+    },
+    {
+      "name": "血红蛋白(HGB)",
+      "value": "135",
+      "unit": "g/L",
+      "reference_range": "130-175",
+      "flag": "normal"
+    },
+    {
+      "name": "血小板计数(PLT)",
+      "value": "98",
+      "unit": "10^9/L",
+      "reference_range": "125-350",
+      "flag": "abnormal_low"
+    }
+  ]
+}
+```
+
+## 踩坑记录
+
+**坑 1：不要让模型自行判断异常**
+
+最初的 Prompt 让模型"根据数值和参考范围判断是否异常"，结果模型偶尔会把参考范围边界值（如刚好等于上限）也标为异常。**正确做法**：只让模型识别图片中已有的异常标记（↑↓H L 等符号），不让它做数值比较。
+
+**坑 2：手机拍照的报告有梯形畸变**
+
+医院打印的报告纸是 A4 竖版，用手机斜角拍摄会产生梯形变形，导致表格列对齐错位，模型把数值和单位识别错列。建议提示用户"水平正对报告拍摄"，或在客户端做透视矫正后再上传。
+
+**坑 3：不同医院报告格式差异大**
+
+某三甲医院的报告用"H/L"标注异常，另一家用"↑↓"，还有用红色字体（图片中颜色差异）的。统一用 `flag` 字段归一化，减少下游处理的兼容负担：
+
+```python
+# 在 Prompt 里加一行说明
+"图片中的异常标记可能是 H/L、↑↓、*、加粗、红色等多种形式，统一映射到上述 flag 值"
+```
+
+**坑 4：max_tokens 设置过低丢失数据**
+
+血常规通常有 20+ 项指标，生化全套可达 40+ 项。如果 `max_tokens` 设为 512，模型会在输出中途截断，导致 JSON 解析失败。建议至少设 2048，全套生化报告设 4096。

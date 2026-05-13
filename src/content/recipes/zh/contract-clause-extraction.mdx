@@ -1,0 +1,167 @@
+---
+title: 从合同图片中提取关键条款
+description: 让 agent 从扫描合同中自动提取甲乙方、金额、履约期限、违约条款等核心字段，输出结构化 JSON，对接审批流或风控系统。
+category: document-understanding
+lang: zh
+models:
+  - Claude 3.5 Sonnet
+  - GPT-4o
+  - Gemini 1.5 Pro
+difficulty: intermediate
+date: 2026-05-13
+author: vlm.md
+---
+
+## 场景
+
+你的 agent 需要处理法务或采购团队上传的合同扫描件，自动提取：
+
+- 甲方、乙方名称
+- 合同金额与货币
+- 合同签署日期、生效日期、到期日期
+- 主要履约义务（简短摘要）
+- 违约金条款（如有）
+- 管辖法院/仲裁机构
+
+提取结果进入审批系统或合同台账，人工只需核对异常项。
+
+## 推荐模型
+
+| 模型 | 适用场景 |
+|---|---|
+| **Claude 3.5 Sonnet** | 长文档理解最稳，条款语义边界识别准确，首选 |
+| **GPT-4o** | 中文合同支持好，速度快，适合批量处理 |
+| **Gemini 1.5 Pro** | 超长合同（>20页）用 1M context 版本性价比最高 |
+
+合同文本密度高、格式多变，Claude 的长上下文理解比其他模型更稳定。
+
+## Prompt 模板
+
+```text
+你是一个合同信息提取专家。请从图片中提取以下字段，严格以 JSON 格式返回，不要有任何解释文字。
+
+字段说明：
+- party_a: 甲方全称（合同中标注为"甲方"或"委托方"的一侧）
+- party_b: 乙方全称
+- contract_amount: 合同金额（数字，不含货币符号；如有多个金额取总价）
+- currency: 货币代码（CNY / USD / EUR 等）
+- signing_date: 签署日期（YYYY-MM-DD，如无则 null）
+- effective_date: 生效日期（YYYY-MM-DD，如无则与签署日期相同）
+- expiry_date: 合同到期或终止日期（YYYY-MM-DD，如无则 null）
+- obligations_summary: 乙方主要履约义务，50字以内概括
+- penalty_clause: 违约金条款原文摘录（50字以内），如无则 null
+- jurisdiction: 争议管辖法院或仲裁机构名称，如无则 null
+
+字段不存在时返回 null，不要猜测或补全。
+```
+
+## 代码示例
+
+```python
+import anthropic
+import base64
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+PROMPT = """你是一个合同信息提取专家。请从图片中提取以下字段，严格以 JSON 格式返回，不要有任何解释文字。
+
+字段说明：
+- party_a: 甲方全称
+- party_b: 乙方全称
+- contract_amount: 合同金额（数字）
+- currency: 货币代码
+- signing_date: 签署日期（YYYY-MM-DD）
+- effective_date: 生效日期（YYYY-MM-DD）
+- expiry_date: 到期日期（YYYY-MM-DD）
+- obligations_summary: 乙方主要履约义务，50字内
+- penalty_clause: 违约金条款摘录，50字内
+- jurisdiction: 管辖法院或仲裁机构
+
+字段不存在时返回 null。"""
+
+
+def extract_contract(image_path: str) -> dict:
+    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode()
+    suffix = Path(image_path).suffix.lower().lstrip(".")
+    media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+        suffix, "image/jpeg"
+    )
+
+    message = client.messages.create(
+        model="claude-3-5-sonnet-20241022",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data},
+                    },
+                    {"type": "text", "text": PROMPT},
+                ],
+            }
+        ],
+    )
+
+    import json, re
+    raw = message.content[0].text.strip()
+    # 去掉可能的 markdown 代码块
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+
+if __name__ == "__main__":
+    import json
+    result = extract_contract("contract.jpg")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+```
+
+预期输出：
+
+```json
+{
+  "party_a": "北京某某科技有限公司",
+  "party_b": "上海某某信息服务有限公司",
+  "contract_amount": 500000,
+  "currency": "CNY",
+  "signing_date": "2024-03-01",
+  "effective_date": "2024-03-01",
+  "expiry_date": "2025-02-28",
+  "obligations_summary": "乙方须于合同生效后30日内完成系统部署，并提供12个月运维支持",
+  "penalty_clause": "乙方逾期交付每日按合同总价0.1%支付违约金，最高不超过10%",
+  "jurisdiction": "北京市海淀区人民法院"
+}
+```
+
+## 踩坑记录
+
+**坑 1：甲乙方认定混乱**
+
+合同中"甲方"有时是买方，有时是服务方，模型偶尔会混淆。加一句说明："以合同第一条中明确标注'甲方'的主体为准，不要根据常识推断"。
+
+**坑 2：金额出现多处，提取错误**
+
+合同里通常有预付款、尾款、总价多个金额。Prompt 里必须明确说"取合同总价"，否则模型可能返回任意一个金额。如果需要分期金额，单独让模型提取 `payment_schedule` 数组。
+
+**坑 3：扫描件分辨率不足导致文字模糊**
+
+合同扫描件低于 150 DPI 时，模型对细小数字（如违约金比例）的识别率明显下降。建议在传图前检查：
+
+```python
+from PIL import Image
+
+def check_dpi(path: str) -> int:
+    with Image.open(path) as img:
+        dpi = img.info.get("dpi", (72, 72))
+        return int(dpi[0])
+
+# dpi < 150 时提示用户重新扫描
+if check_dpi("contract.jpg") < 150:
+    print("警告：扫描分辨率过低，提取结果可能不准确")
+```
+
+**坑 4：多页合同只传了首页**
+
+关键条款（尤其违约金、管辖条款）通常在合同末尾。如果只传首页，这些字段会返回 null。多页合同需要合并所有页再提取，或分页提取后合并结果（以非 null 值优先）。
