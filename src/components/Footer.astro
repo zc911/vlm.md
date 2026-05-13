@@ -6,18 +6,26 @@ interface Props {
 const { lang } = Astro.props;
 
 const text = {
-  zh: { contribute: '贡献食谱', contact: '联系我', builtWith: '用 Astro 构建，部署于 Cloudflare Pages' },
-  en: { contribute: 'Contribute a Recipe', contact: 'Contact', builtWith: 'Built with Astro, deployed on Cloudflare Pages' },
+  zh: { contribute: '贡献食谱', contact: '联系我', builtWith: '用 Astro 构建，部署于 Cloudflare Pages', friendlyLinks: '友情链接' },
+  en: { contribute: 'Contribute a Recipe', contact: 'Contact', builtWith: 'Built with Astro, deployed on Cloudflare Pages', friendlyLinks: 'Friends' },
 }[lang];
 ---
 
 <footer class="border-t border-gray-800 mt-16">
-  <div class="max-w-5xl mx-auto px-4 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-sm text-gray-500">
-    <span class="font-mono">vlm<span class="text-violet-400">.md</span></span>
-    <a href={`https://github.com/vlm-md/vlm.md/blob/main/CONTRIBUTING${lang === 'zh' ? '.zh' : ''}.md`} class="hover:text-violet-400 transition-colors">
-      {text.contribute}
-    </a>
-    <a href="mailto:zack.mm.chen@gmail.com" class="hover:text-violet-400 transition-colors">{text.contact}</a>
-    <span>{text.builtWith}</span>
+  <div class="max-w-5xl mx-auto px-4 py-8 flex flex-col gap-4 text-sm text-gray-500">
+    <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
+      <span class="font-mono">vlm<span class="text-violet-400">.md</span></span>
+      <a href={`https://github.com/vlm-md/vlm.md/blob/main/CONTRIBUTING${lang === 'zh' ? '.zh' : ''}.md`} class="hover:text-violet-400 transition-colors">
+        {text.contribute}
+      </a>
+      <a href="mailto:zack.mm.chen@gmail.com" class="hover:text-violet-400 transition-colors">{text.contact}</a>
+      <span>{text.builtWith}</span>
+    </div>
+    <div class="flex flex-col sm:flex-row items-center justify-center gap-2 text-xs text-gray-600">
+      <span>{text.friendlyLinks}:</span>
+      <a href="https://clawhub.md" target="_blank" rel="noopener noreferrer" class="hover:text-violet-400 transition-colors font-mono">clawhub<span class="text-violet-500">.md</span></a>
+      <span class="hidden sm:inline">·</span>
+      <a href="https://agentos.md" target="_blank" rel="noopener noreferrer" class="hover:text-violet-400 transition-colors font-mono">agentos<span class="text-violet-500">.md</span></a>
+    </div>
   </div>
 </footer>
